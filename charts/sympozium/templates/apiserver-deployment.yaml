@@ -25,7 +25,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --event-bus-url={{ include "sympozium.natsUrl" . }}
-          {{- if .Values.apiserver.webUI.enabled }}
+{{- if .Values.apiserver.webUI.enabled }}
             - --serve-ui
           {{- end }}
           env:
@@ -33,13 +33,37 @@ spec:
             - name: SYMPOZIUM_UI_TOKEN
               value: {{ .Values.apiserver.webUI.token | quote }}
           {{- else }}
-            - name: SYMPOZIUM_UI_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "sympozium.fullname" . }}-ui-token
                   key: token
                   optional: true
-          {{- end }}
+            - name: POD_NAME
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+                  fieldPath: spec.nodeName
+            {{- if .Values.observability.enabled }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.observability.endpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: {{ .Values.observability.protocol | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: "{{ .Values.observability.serviceNamePrefix }}-apiserver"
+            - name: OTEL_TRACES_SAMPLER
+              value: "parentbased_traceidratio"
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: {{ .Values.observability.samplingRatio | quote }}
+            - name: SYMPOZIUM_OTEL_BATCH_TIMEOUT
+              value: {{ .Values.observability.apiServer.batchTimeout | quote }}
+            {{- if .Values.observability.headers }}
+            - name: OTEL_EXPORTER_OTLP_HEADERS
+              value: {{ include "sympozium.otelHeaders" . | quote }}
+            {{- if .Values.observability.resourceAttributes }}
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ include "sympozium.otelResourceAttrs" . | quote }}
           ports:
             - containerPort: 8080
               name: http

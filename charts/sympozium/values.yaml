@@ -152,6 +152,33 @@ containerSecurityContext:
   capabilities:
     drop: ["ALL"]
 
+# -- OpenTelemetry Observability
+observability:
+  # -- Master switch. When false, all components init noop OTel (zero overhead).
+  enabled: false
+  # -- OTLP collector endpoint. Example: "http://otel-collector.monitoring.svc:4317"
+  endpoint: ""
+  # -- OTLP transport: "grpc" (default, port 4317) or "http/protobuf" (port 4318)
+  protocol: "grpc"
+  # -- Static OTLP export headers (e.g., {"Authorization": "Bearer token"}).
+  headers: {}
+  # -- Secret reference for sensitive OTLP export headers.
+  headersSecretRef: ""
+  # -- Trace sampling probability: 0.0 (none) to 1.0 (all).
+  samplingRatio: 1.0
+  # -- Additional OTel resource attributes applied to ALL components.
+  resourceAttributes: {}
+  # -- Prefix for service names. Component name is appended.
+  serviceNamePrefix: "sympozium"
+  # -- Per-component tuning
+  controller:
+    batchTimeout: "5s"
+  agentRunner:
+    batchTimeout: "1s"
+    shutdownTimeout: "10s"
+  apiServer:
+    batchTimeout: "5s"
+
 # -- ServiceMonitor for Prometheus (requires prometheus-operator)
 serviceMonitor:
   enabled: false

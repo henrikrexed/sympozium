@@ -131,26 +131,21 @@ func (s *Server) buildMux(frontendFS fs.FS, token string) http.Handler {
 // If a frontend FS is provided, serve it as an SPA fallback.
 	if frontendFS != nil {
 		mux.HandleFunc("/", s.spaHandler(frontendFS))
-// Wrap the mux with otelhttp for automatic HTTP span instrumentation.
-	// Extracts incoming traceparent headers and creates server spans with
-	// http.request.method, url.path, http.response.status_code attributes.
+	}
+
+	// Wrap the mux with otelhttp for automatic HTTP span instrumentation.
 	handler := otelhttp.NewHandler(mux, "sympozium-apiserver",
 		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
 			return "sympozium.api." + r.Method
 		}),
 	)
-	server := &http.Server{
-		Addr:              addr,
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
 
 	// Wrap with auth middleware if a token is configured.
 	if token != "" {
-		return authMiddleware(token, mux)
+		return authMiddleware(token, handler)
 	}
 
-	return mux
+	return handler
 }
 
 // authMiddleware returns an http.Handler that checks for a valid Bearer token

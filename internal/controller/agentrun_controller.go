@@ -281,6 +281,10 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	agentRun.Status.Phase = sympoziumv1alpha1.AgentRunPhaseRunning
 	agentRun.Status.JobName = job.Name
 	agentRun.Status.StartedAt = &now
+	// Set the trace ID so operators can look up the full distributed trace.
+	if sc := span.SpanContext(); sc.HasTraceID() {
+		agentRun.Status.TraceID = sc.TraceID().String()
+	}
 	if err := r.Status().Update(ctx, agentRun); err != nil {
 		return ctrl.Result{}, err
 	}
