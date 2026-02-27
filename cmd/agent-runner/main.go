@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,17 +63,18 @@ type streamChunk struct {
 }
 
 func main() {
-	log.SetFlags(log.Ltime | log.Lmicroseconds)
-	log.Println("agent-runner starting")
+	slog.Info("agent.start")
 
 	// Initialize OpenTelemetry SDK with ephemeral-pod-optimized settings.
+	// After Init, slog.Default() is replaced with an OTel-bridged handler
+	// that fans out to stderr JSON + OTLP log exporter with trace correlation.
 	tel, telErr := telemetry.Init(context.Background(), telemetry.Config{
 		ServiceName:     "sympozium-agent-runner",
 		BatchTimeout:    1 * time.Second,
 		ShutdownTimeout: 10 * time.Second,
 	})
 	if telErr != nil {
-		log.Printf("WARNING: OTel init failed: %v (continuing without telemetry)", telErr)
+		slog.Warn("otel.init.failed", "error", telErr)
 	}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -121,14 +122,14 @@ func main() {
 			sourceChannel, sourceChatID, sourceChannel, sourceChatID,
 		)
 		systemPrompt += channelCtx
-		log.Printf("channel context injected: channel=%s chatId=%s", sourceChannel, sourceChatID)
+		slog.Info("channel.context.injected", "channel", sourceChannel, "chat_id", sourceChatID)
 	}
 
 	// Resolve tool definitions.
 	var tools []ToolDef
 	if toolsEnabled {
 		tools = defaultTools()
-		log.Printf("tools enabled: %d tool(s) registered", len(tools))
+		slog.Info("tools.enabled", "count", len(tools))
 	}
 
 	// Read existing memory if available.
@@ -136,7 +137,7 @@ func main() {
 	if memoryEnabled {
 		if b, err := os.ReadFile("/memory/MEMORY.md"); err == nil {
 			memoryContent = strings.TrimSpace(string(b))
-			log.Printf("loaded memory (%d bytes)", len(memoryContent))
+			slog.Info("memory.loaded", "bytes", len(memoryContent))
 		}
 	}
 
@@ -162,9 +163,6 @@ func main() {
 		os.Getenv("AZURE_OPENAI_API_KEY"),
 	)
 
-	log.Printf("provider=%s model=%s baseURL=%s tools=%v task=%q",
-		provider, modelName, baseURL, toolsEnabled, truncate(task, 80))
-
 	_ = os.MkdirAll("/ipc/output", 0o755)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -182,6 +180,16 @@ func main() {
 			attribute.String("gen_ai.system", provider),
 			attribute.String("gen_ai.request.model", modelName),
 		),
+	)
+
+	slog.InfoContext(ctx, "agent.run.start",
+		"provider", provider,
+		"model", modelName,
+		"base_url", baseURL,
+		"tools_enabled", toolsEnabled,
+		"task", truncate(task, 80),
+		"agent.run.id", getEnv("AGENT_RUN_ID", ""),
+		"agent.id", getEnv("AGENT_ID", ""),
 	)
 
 	start := time.Now()
@@ -211,13 +219,22 @@ func main() {
 	debugMode := getEnv("DEBUG", "") == "true"
 
 	if err != nil {
-		log.Printf("LLM call failed: %v", err)
+		slog.ErrorContext(ctx, "agent.run.error",
+			"error", err,
+			"duration_ms", elapsed.Milliseconds(),
+		)
 		res.Status = "error"
 		res.Error = err.Error()
 		rootSpan.RecordError(err)
 		rootSpan.SetStatus(codes.Error, err.Error())
 	} else {
-		log.Printf("LLM call succeeded (tokens: in=%d out=%d, tool_calls=%d)", inputTokens, outputTokens, toolCalls)
+		slog.InfoContext(ctx, "agent.run.complete",
+			"status", "success",
+			"input_tokens", inputTokens,
+			"output_tokens", outputTokens,
+			"tool_calls", toolCalls,
+			"duration_ms", elapsed.Milliseconds(),
+		)
 		res.Status = "success"
 		res.Response = responseText
 		res.Metrics.InputTokens = inputTokens
@@ -238,7 +255,7 @@ func main() {
 	if memoryEnabled && res.Response != "" {
 		if memUpdate := extractMemoryUpdate(res.Response); memUpdate != "" {
 			fmt.Fprintf(os.Stdout, "\n__SYMPOZIUM_MEMORY__%s__SYMPOZIUM_MEMORY_END__\n", memUpdate)
-			log.Printf("emitted memory update (%d bytes)", len(memUpdate))
+			slog.InfoContext(ctx, "memory.update.emitted", "bytes", len(memUpdate))
 		}
 	}
 
@@ -268,10 +285,10 @@ func main() {
 	}
 
 	if res.Status == "error" {
-		log.Printf("agent-runner finished with error: %s", res.Error)
+		slog.ErrorContext(ctx, "agent.run.finished", "status", "error", "error", res.Error)
 		os.Exit(1)
 	}
-	log.Println("agent-runner finished successfully")
+	slog.InfoContext(ctx, "agent.run.finished", "status", "success")
 }
 
 // callAnthropic uses the official Anthropic Go SDK with optional tool calling.
@@ -324,6 +341,12 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 			),
 		)
 
+		slog.InfoContext(iterCtx, "llm.call.start",
+			"gen_ai.system", "anthropic",
+			"gen_ai.request.model", model,
+			"iteration", i+1,
+		)
+
 		callStart := time.Now()
 		params := anthropic.MessageNewParams{
 			Model:     anthropic.Model(model),
@@ -340,6 +363,12 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 		message, err := client.Messages.New(iterCtx, params)
 		callDuration := time.Since(callStart)
 		if err != nil {
+			slog.ErrorContext(iterCtx, "llm.call.error",
+				"gen_ai.system", "anthropic",
+				"gen_ai.request.model", model,
+				"error", err,
+				"duration_ms", callDuration.Milliseconds(),
+			)
 			chatSpan.RecordError(err)
 			chatSpan.SetStatus(codes.Error, "anthropic api error")
 			chatSpan.End()
@@ -372,6 +401,15 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 		)
 		llmTokensInput.Add(iterCtx, int64(inTok), modelAttrs)
 		llmTokensOutput.Add(iterCtx, int64(outTok), modelAttrs)
+
+		slog.InfoContext(iterCtx, "llm.call.complete",
+			"gen_ai.system", "anthropic",
+			"gen_ai.request.model", model,
+			"input_tokens", inTok,
+			"output_tokens", outTok,
+			"stop_reason", string(message.StopReason),
+			"duration_ms", callDuration.Milliseconds(),
+		)
 
 		// Separate text blocks and tool-use blocks.
 		var textContent strings.Builder
@@ -407,7 +445,11 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 		var resultBlocks []anthropic.ContentBlockParamUnion
 		for _, tu := range toolUseBlocks {
 			totalToolCalls++
-			log.Printf("tool_use [%d]: %s id=%s", totalToolCalls, tu.Name, tu.ID)
+			slog.InfoContext(ctx, "tool.call.dispatch",
+				"tool.name", tu.Name,
+				"tool.id", tu.ID,
+				"tool.call_number", totalToolCalls,
+			)
 
 			result := executeToolCall(ctx, tu.Name, string(tu.Input))
 			isErr := strings.HasPrefix(result, "Error:")
@@ -482,6 +524,12 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 			),
 		)
 
+		slog.InfoContext(iterCtx, "llm.call.start",
+			"gen_ai.system", provider,
+			"gen_ai.request.model", model,
+			"iteration", i+1,
+		)
+
 		callStart := time.Now()
 		params := openai.ChatCompletionNewParams{
 			Model:    openai.ChatModel(model),
@@ -494,6 +542,12 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 		completion, err := client.Chat.Completions.New(iterCtx, params)
 		callDuration := time.Since(callStart)
 		if err != nil {
+			slog.ErrorContext(iterCtx, "llm.call.error",
+				"gen_ai.system", provider,
+				"gen_ai.request.model", model,
+				"error", err,
+				"duration_ms", callDuration.Milliseconds(),
+			)
 			chatSpan.RecordError(err)
 			chatSpan.SetStatus(codes.Error, "openai api error")
 			chatSpan.End()
@@ -531,6 +585,15 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 		llmTokensInput.Add(iterCtx, int64(inTok), modelAttrs)
 		llmTokensOutput.Add(iterCtx, int64(outTok), modelAttrs)
 
+		slog.InfoContext(iterCtx, "llm.call.complete",
+			"gen_ai.system", provider,
+			"gen_ai.request.model", model,
+			"input_tokens", inTok,
+			"output_tokens", outTok,
+			"finish_reason", finishReason,
+			"duration_ms", callDuration.Milliseconds(),
+		)
+
 		if len(completion.Choices) == 0 {
 			return "", totalInputTokens, totalOutputTokens, totalToolCalls,
 				fmt.Errorf("no choices in completion response")
@@ -546,7 +609,11 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 			for _, tc := range choice.Message.ToolCalls {
 				fc := tc.AsFunction()
 				totalToolCalls++
-				log.Printf("tool_call [%d]: %s id=%s", totalToolCalls, fc.Function.Name, fc.ID)
+				slog.InfoContext(ctx, "tool.call.dispatch",
+					"tool.name", fc.Function.Name,
+					"tool.id", fc.ID,
+					"tool.call_number", totalToolCalls,
+				)
 
 				result := executeToolCall(ctx, fc.Function.Name, fc.Function.Arguments)
 				messages = append(messages, openai.ToolMessage(result, fc.ID))
@@ -567,11 +634,11 @@ func writeJSON(path string, v any) {
 	_ = os.MkdirAll(dir, 0o755)
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		log.Printf("WARNING: failed to marshal JSON for %s: %v", path, err)
+		slog.Warn("json.marshal.failed", "path", path, "error", err)
 		return
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
-		log.Printf("WARNING: failed to write %s: %v", path, err)
+		slog.Warn("file.write.failed", "path", path, "error", err)
 	}
 }
 
@@ -599,7 +666,7 @@ func truncate(s string, n int) string {
 }
 
 func fatal(msg string) {
-	log.Println("FATAL: " + msg)
+	slog.Error("agent.fatal", "error", msg)
 	_ = os.MkdirAll("/ipc/output", 0o755)
 	_ = os.WriteFile("/ipc/done", []byte("done"), 0o644)
 	writeJSON("/ipc/output/result.json", agentResult{

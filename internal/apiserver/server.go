@@ -5,7 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/fs"
+"io/fs"
+"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -797,10 +798,15 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
-// apiError writes an HTTP error and records it as a metric.
+// apiError writes an HTTP error, records it as a metric, and emits a
+// structured log event with trace correlation.
 func apiError(ctx context.Context, w http.ResponseWriter, msg string, code int) {
 	http.Error(w, msg, code)
 	apiErrorsTotal.Add(ctx, 1, metric.WithAttributes(
 		attribute.Int("http.response.status_code", code),
 	))
+	slog.WarnContext(ctx, "api.error",
+		"http.response.status_code", code,
+		"error", msg,
+	)
 }

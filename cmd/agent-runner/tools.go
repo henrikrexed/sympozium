@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -218,7 +218,7 @@ func executeToolCall(ctx context.Context, name string, argsJSON string) string {
 		span.End()
 	}()
 
-	log.Printf("tool call: %s args=%s", name, truncateStr(argsJSON, 200))
+	slog.InfoContext(ctx, "tool.call.start", "tool.name", name, "tool.args", truncateStr(argsJSON, 200))
 
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
@@ -250,11 +250,14 @@ func executeToolCall(ctx context.Context, name string, argsJSON string) string {
 	isErr := strings.HasPrefix(result, "Error")
 	span.SetAttributes(attribute.Bool("tool.success", !isErr))
 	if isErr {
+		slog.ErrorContext(ctx, "tool.call.error", "tool.name", name, "error", truncateStr(result, 200))
 		span.SetStatus(codes.Error, truncateStr(result, 200))
 		agentErrorsTotal.Add(ctx, 1, metric.WithAttributes(
 			attribute.String("error.type", "tool"),
 			attribute.String("tool.name", name),
 		))
+	} else {
+		slog.InfoContext(ctx, "tool.call.end", "tool.name", name, "success", true)
 	}
 	return result
 }
@@ -357,7 +360,7 @@ func sendChannelMessageTool(args map[string]any) string {
 		return fmt.Sprintf("Error writing message file: %v", err)
 	}
 
-	log.Printf("Wrote channel message: channel=%s chatId=%s len=%d", channel, chatID, len(text))
+	slog.Info("tool.send_channel_message.complete", "channel", channel, "chat_id", chatID, "text_len", len(text))
 	target := chatID
 	if target == "" {
 		target = "owner (self)"
@@ -451,7 +454,7 @@ func fetchURLTool(ctx context.Context, parentSpan trace.Span, args map[string]an
 		content = content[:maxChars] + fmt.Sprintf("\n\n... (truncated at %d chars, total ~%d)", maxChars, len(string(body)))
 	}
 
-	log.Printf("Fetched URL %s: status=%d content-type=%s len=%d", rawURL, resp.StatusCode, contentType, len(content))
+	slog.InfoContext(ctx, "tool.fetch_url.complete", "url", rawURL, "status", resp.StatusCode, "content_type", contentType, "content_len", len(content))
 	return content
 }
 
@@ -639,7 +642,7 @@ func writeFileTool(args map[string]any) string {
 		return fmt.Sprintf("Error writing file: %v", err)
 	}
 
-	log.Printf("Wrote file %s (%d bytes)", clean, len(content))
+	slog.Info("tool.write_file.complete", "path", clean, "bytes", len(content))
 	return fmt.Sprintf("Successfully wrote %d bytes to %s", len(content), clean)
 }
 
@@ -727,7 +730,7 @@ func executeCommand(ctx context.Context, args map[string]any) string {
 	// Write context file alongside the request for future sidecar use.
 	writeTraceContext(ctx, toolsDir, id)
 
-	log.Printf("Wrote exec request %s: %s", id, truncateStr(command, 120))
+	slog.InfoContext(ctx, "ipc.exec_request.sent", "request_id", id, "command", truncateStr(command, 120))
 
 	// Poll for result with a deadline.
 	deadline := time.Now().Add(time.Duration(timeoutSec+10) * time.Second)
@@ -884,7 +887,7 @@ func scheduleTaskTool(args map[string]any) string {
 		return fmt.Sprintf("Error writing schedule file: %v", err)
 	}
 
-	log.Printf("Wrote schedule request: name=%s action=%s schedule=%s", name, action, schedule)
+	slog.Info("tool.schedule.submitted", "name", name, "action", action, "schedule", schedule)
 
 	switch action {
 	case "create":
