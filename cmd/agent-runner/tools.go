@@ -16,6 +16,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/html"
@@ -206,10 +207,14 @@ func executeToolCall(ctx context.Context, name string, argsJSON string) string {
 			attribute.String("tool.name", name),
 		),
 	)
+	toolAttrs := metric.WithAttributes(attribute.String("tool.name", name))
+	toolCallsTotal.Add(ctx, 1, toolAttrs)
 	defer func() {
+		durationMs := float64(time.Since(toolStart).Milliseconds())
 		span.SetAttributes(
-			attribute.Int64("tool.duration_ms", time.Since(toolStart).Milliseconds()),
+			attribute.Int64("tool.duration_ms", int64(durationMs)),
 		)
+		toolDurationHist.Record(ctx, durationMs, toolAttrs)
 		span.End()
 	}()
 
@@ -246,6 +251,10 @@ func executeToolCall(ctx context.Context, name string, argsJSON string) string {
 	span.SetAttributes(attribute.Bool("tool.success", !isErr))
 	if isErr {
 		span.SetStatus(codes.Error, truncateStr(result, 200))
+		agentErrorsTotal.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error.type", "tool"),
+			attribute.String("tool.name", name),
+		))
 	}
 	return result
 }
@@ -674,6 +683,8 @@ func executeCommand(ctx context.Context, args map[string]any) string {
 	}
 
 	id := fmt.Sprintf("%d", time.Now().UnixNano())
+
+	ipcRequestsTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("ipc.method", "exec")))
 
 	// Start an IPC request span.
 	_, ipcSpan := agentTracer.Start(ctx, "ipc.exec_request",

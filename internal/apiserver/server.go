@@ -14,6 +14,9 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -22,6 +25,9 @@ import (
 	sympoziumv1alpha1 "github.com/alexsjones/sympozium/api/v1alpha1"
 	"github.com/alexsjones/sympozium/internal/eventbus"
 )
+
+var apiMeter = otel.Meter("sympozium.ai/apiserver")
+var apiErrorsTotal, _ = apiMeter.Int64Counter("sympozium.errors", metric.WithUnit("{error}"), metric.WithDescription("API server errors"))
 
 // Server is the Sympozium API server.
 type Server struct {
@@ -216,7 +222,7 @@ func (s *Server) listInstances(w http.ResponseWriter, r *http.Request) {
 
 	var list sympoziumv1alpha1.SympoziumInstanceList
 	if err := s.client.List(r.Context(), &list, client.InNamespace(ns)); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		apiError(r.Context(), w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -232,7 +238,7 @@ func (s *Server) getInstance(w http.ResponseWriter, r *http.Request) {
 
 	var inst sympoziumv1alpha1.SympoziumInstance
 	if err := s.client.Get(r.Context(), types.NamespacedName{Name: name, Namespace: ns}, &inst); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		apiError(r.Context(), w, err.Error(), http.StatusNotFound)
 		return
 	}
 
@@ -250,7 +256,7 @@ func (s *Server) deleteInstance(w http.ResponseWriter, r *http.Request) {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 	}
 	if err := s.client.Delete(r.Context(), inst); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		apiError(r.Context(), w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -331,7 +337,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 
 	var list sympoziumv1alpha1.AgentRunList
 	if err := s.client.List(r.Context(), &list, client.InNamespace(ns)); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		apiError(r.Context(), w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -347,7 +353,7 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 
 	var run sympoziumv1alpha1.AgentRun
 	if err := s.client.Get(r.Context(), types.NamespacedName{Name: name, Namespace: ns}, &run); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		apiError(r.Context(), w, err.Error(), http.StatusNotFound)
 		return
 	}
 
@@ -372,12 +378,12 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 
 	var req CreateRunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		apiError(r.Context(), w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	if req.InstanceRef == "" || req.Task == "" {
-		http.Error(w, "instanceRef and task are required", http.StatusBadRequest)
+		apiError(r.Context(), w, "instanceRef and task are required", http.StatusBadRequest)
 		return
 	}
 
@@ -411,7 +417,7 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.client.Create(r.Context(), run); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		apiError(r.Context(), w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -447,7 +453,7 @@ func (s *Server) listPolicies(w http.ResponseWriter, r *http.Request) {
 
 	var list sympoziumv1alpha1.SympoziumPolicyList
 	if err := s.client.List(r.Context(), &list, client.InNamespace(ns)); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		apiError(r.Context(), w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -463,7 +469,7 @@ func (s *Server) getPolicy(w http.ResponseWriter, r *http.Request) {
 
 	var pol sympoziumv1alpha1.SympoziumPolicy
 	if err := s.client.Get(r.Context(), types.NamespacedName{Name: name, Namespace: ns}, &pol); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		apiError(r.Context(), w, err.Error(), http.StatusNotFound)
 		return
 	}
 
@@ -480,7 +486,7 @@ func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
 
 	var list sympoziumv1alpha1.SkillPackList
 	if err := s.client.List(r.Context(), &list, client.InNamespace(ns)); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		apiError(r.Context(), w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -496,7 +502,7 @@ func (s *Server) getSkill(w http.ResponseWriter, r *http.Request) {
 
 	var sk sympoziumv1alpha1.SkillPack
 	if err := s.client.Get(r.Context(), types.NamespacedName{Name: name, Namespace: ns}, &sk); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		apiError(r.Context(), w, err.Error(), http.StatusNotFound)
 		return
 	}
 
@@ -789,4 +795,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
+}
+
+// apiError writes an HTTP error and records it as a metric.
+func apiError(ctx context.Context, w http.ResponseWriter, msg string, code int) {
+	http.Error(w, msg, code)
+	apiErrorsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.Int("http.response.status_code", code),
+	))
 }

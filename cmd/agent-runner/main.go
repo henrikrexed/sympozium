@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/alexsjones/sympozium/pkg/telemetry"
@@ -30,6 +31,18 @@ import (
 const maxToolIterations = 25
 
 var agentTracer = otel.Tracer("sympozium.ai/agent-runner")
+var agentMeter = otel.Meter("sympozium.ai/agent-runner")
+
+// Metric instruments — the global MeterProvider delegate ensures these work
+// after telemetry.Init() sets the real provider.
+var (
+	llmTokensInput, _   = agentMeter.Int64Counter("sympozium.llm.tokens.input", metric.WithUnit("{token}"), metric.WithDescription("LLM input tokens consumed"))
+	llmTokensOutput, _  = agentMeter.Int64Counter("sympozium.llm.tokens.output", metric.WithUnit("{token}"), metric.WithDescription("LLM output tokens consumed"))
+	toolCallsTotal, _   = agentMeter.Int64Counter("sympozium.tool.calls", metric.WithUnit("{call}"), metric.WithDescription("Tool invocations"))
+	toolDurationHist, _ = agentMeter.Float64Histogram("sympozium.tool.duration_ms", metric.WithUnit("ms"), metric.WithDescription("Tool execution duration"))
+	ipcRequestsTotal, _ = agentMeter.Int64Counter("sympozium.ipc.requests", metric.WithUnit("{request}"), metric.WithDescription("IPC exec requests"))
+	agentErrorsTotal, _ = agentMeter.Int64Counter("sympozium.errors", metric.WithUnit("{error}"), metric.WithDescription("Errors encountered"))
+)
 
 type agentResult struct {
 	Status   string `json:"status"`
@@ -330,6 +343,7 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 			chatSpan.RecordError(err)
 			chatSpan.SetStatus(codes.Error, "anthropic api error")
 			chatSpan.End()
+			agentErrorsTotal.Add(iterCtx, 1, metric.WithAttributes(attribute.String("error.type", "llm_api")))
 			var apiErr *anthropic.Error
 			if errors.As(err, &apiErr) {
 				return "", totalInputTokens, totalOutputTokens, totalToolCalls,
@@ -351,6 +365,13 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 			attribute.Float64("gen_ai.client.operation.duration_s", callDuration.Seconds()),
 		)
 		chatSpan.End()
+
+		modelAttrs := metric.WithAttributes(
+			attribute.String("gen_ai.system", "anthropic"),
+			attribute.String("gen_ai.request.model", model),
+		)
+		llmTokensInput.Add(iterCtx, int64(inTok), modelAttrs)
+		llmTokensOutput.Add(iterCtx, int64(outTok), modelAttrs)
 
 		// Separate text blocks and tool-use blocks.
 		var textContent strings.Builder
@@ -476,6 +497,7 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 			chatSpan.RecordError(err)
 			chatSpan.SetStatus(codes.Error, "openai api error")
 			chatSpan.End()
+			agentErrorsTotal.Add(iterCtx, 1, metric.WithAttributes(attribute.String("error.type", "llm_api")))
 			var apiErr *openai.Error
 			if errors.As(err, &apiErr) {
 				return "", totalInputTokens, totalOutputTokens, totalToolCalls,
@@ -501,6 +523,13 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 			attribute.Float64("gen_ai.client.operation.duration_s", callDuration.Seconds()),
 		)
 		chatSpan.End()
+
+		modelAttrs := metric.WithAttributes(
+			attribute.String("gen_ai.system", provider),
+			attribute.String("gen_ai.request.model", model),
+		)
+		llmTokensInput.Add(iterCtx, int64(inTok), modelAttrs)
+		llmTokensOutput.Add(iterCtx, int64(outTok), modelAttrs)
 
 		if len(completion.Choices) == 0 {
 			return "", totalInputTokens, totalOutputTokens, totalToolCalls,
