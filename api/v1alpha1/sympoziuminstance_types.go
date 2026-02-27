@@ -32,6 +32,48 @@ type SympoziumInstanceSpec struct {
 	// When enabled, a MEMORY.md ConfigMap is managed and mounted into agent pods.
 	// +optional
 	Memory *MemorySpec `json:"memory,omitempty"`
+
+	// Observability configures OpenTelemetry for agent pods spawned by this instance.
+	// When nil, inherits from Helm chart global values.
+	// +optional
+	Observability *ObservabilitySpec `json:"observability,omitempty"`
+}
+
+// ObservabilitySpec controls OTel instrumentation for a specific instance.
+type ObservabilitySpec struct {
+	// Enabled controls whether OTel instrumentation is active for this instance.
+	// Overrides the global Helm value when set.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Endpoint is the OTLP collector endpoint (gRPC).
+	// Example: "http://otel-collector.monitoring:4317"
+	// Overrides the global Helm value when set.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// Protocol is the OTLP transport protocol.
+	// +optional
+	// +kubebuilder:validation:Enum=grpc;"http/protobuf"
+	Protocol string `json:"protocol,omitempty"`
+
+	// Headers are additional OTLP export headers (e.g., auth tokens).
+	// +optional
+	Headers map[string]string `json:"headers,omitempty"`
+
+	// HeadersSecretRef references a Secret containing OTLP export headers.
+	// +optional
+	HeadersSecretRef string `json:"headersSecretRef,omitempty"`
+
+	// SamplingRatio is the trace sampling probability (0.0 to 1.0).
+	// +optional
+	// +kubebuilder:validation:Minimum=0.0
+	// +kubebuilder:validation:Maximum=1.0
+	SamplingRatio *float64 `json:"samplingRatio,omitempty"`
+
+	// ResourceAttributes are additional OTel resource attributes.
+	// +optional
+	ResourceAttributes map[string]string `json:"resourceAttributes,omitempty"`
 }
 
 // MemorySpec configures persistent memory for a SympoziumInstance.
