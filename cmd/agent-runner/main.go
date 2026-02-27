@@ -17,11 +17,19 @@ import (
 	"github.com/openai/openai-go/v3/azure"
 	openaioption "github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/shared"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/alexsjones/sympozium/pkg/telemetry"
 )
 
 // maxToolIterations is the maximum number of tool-call round-trips before
 // the agent stops and returns whatever text it has.
 const maxToolIterations = 25
+
+var agentTracer = otel.Tracer("sympozium.ai/agent-runner")
 
 type agentResult struct {
 	Status   string `json:"status"`
@@ -44,6 +52,21 @@ type streamChunk struct {
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	log.Println("agent-runner starting")
+
+	// Initialize OpenTelemetry SDK with ephemeral-pod-optimized settings.
+	tel, telErr := telemetry.Init(context.Background(), telemetry.Config{
+		ServiceName:     "sympozium-agent-runner",
+		BatchTimeout:    1 * time.Second,
+		ShutdownTimeout: 10 * time.Second,
+	})
+	if telErr != nil {
+		log.Printf("WARNING: OTel init failed: %v (continuing without telemetry)", telErr)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = tel.Shutdown(shutdownCtx)
+	}()
 
 	task := getEnv("TASK", "")
 	if task == "" {
@@ -134,6 +157,20 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
+	// Extract parent trace context from TRACEPARENT env var (set by controller).
+	ctx = telemetry.ExtractParentFromEnv(ctx)
+
+	// Start the root agent.run span.
+	ctx, rootSpan := agentTracer.Start(ctx, "agent.run",
+		trace.WithAttributes(
+			attribute.String("agent.run.id", getEnv("AGENT_RUN_ID", "")),
+			attribute.String("agent.id", getEnv("AGENT_ID", "")),
+			attribute.String("session.key", getEnv("SESSION_KEY", "")),
+			attribute.String("gen_ai.system", provider),
+			attribute.String("gen_ai.request.model", modelName),
+		),
+	)
+
 	start := time.Now()
 
 	var (
@@ -164,6 +201,8 @@ func main() {
 		log.Printf("LLM call failed: %v", err)
 		res.Status = "error"
 		res.Error = err.Error()
+		rootSpan.RecordError(err)
+		rootSpan.SetStatus(codes.Error, err.Error())
 	} else {
 		log.Printf("LLM call succeeded (tokens: in=%d out=%d, tool_calls=%d)", inputTokens, outputTokens, toolCalls)
 		res.Status = "success"
@@ -171,6 +210,16 @@ func main() {
 		res.Metrics.InputTokens = inputTokens
 		res.Metrics.OutputTokens = outputTokens
 	}
+
+	// Set completion attributes on the root span.
+	rootSpan.SetAttributes(
+		attribute.String("sympozium.agent.status", res.Status),
+		attribute.Int("sympozium.agent.total_input_tokens", inputTokens),
+		attribute.Int("sympozium.agent.total_output_tokens", outputTokens),
+		attribute.Int("sympozium.agent.total_tool_calls", toolCalls),
+		attribute.Int64("sympozium.agent.duration_ms", elapsed.Milliseconds()),
+	)
+	rootSpan.End()
 
 	// Extract and emit memory update before stripping markers from the response.
 	if memoryEnabled && res.Response != "" {
@@ -252,6 +301,17 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 	totalToolCalls := 0
 
 	for i := 0; i < maxToolIterations; i++ {
+		// Start a gen_ai.chat span for this LLM API call.
+		iterCtx, chatSpan := agentTracer.Start(ctx, "gen_ai.chat",
+			trace.WithSpanKind(trace.SpanKindClient),
+			trace.WithAttributes(
+				attribute.String("gen_ai.system", "anthropic"),
+				attribute.String("gen_ai.request.model", model),
+				attribute.Int("gen_ai.chat.iteration", i+1),
+			),
+		)
+
+		callStart := time.Now()
 		params := anthropic.MessageNewParams{
 			Model:     anthropic.Model(model),
 			MaxTokens: int64(8192),
@@ -264,8 +324,12 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 			params.Tools = anthropicTools
 		}
 
-		message, err := client.Messages.New(ctx, params)
+		message, err := client.Messages.New(iterCtx, params)
+		callDuration := time.Since(callStart)
 		if err != nil {
+			chatSpan.RecordError(err)
+			chatSpan.SetStatus(codes.Error, "anthropic api error")
+			chatSpan.End()
 			var apiErr *anthropic.Error
 			if errors.As(err, &apiErr) {
 				return "", totalInputTokens, totalOutputTokens, totalToolCalls,
@@ -275,8 +339,18 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 				fmt.Errorf("Anthropic API error: %w", err)
 		}
 
-		totalInputTokens += int(message.Usage.InputTokens)
-		totalOutputTokens += int(message.Usage.OutputTokens)
+		inTok := int(message.Usage.InputTokens)
+		outTok := int(message.Usage.OutputTokens)
+		totalInputTokens += inTok
+		totalOutputTokens += outTok
+
+		chatSpan.SetAttributes(
+			attribute.Int("gen_ai.usage.input_tokens", inTok),
+			attribute.Int("gen_ai.usage.output_tokens", outTok),
+			attribute.String("gen_ai.response.finish_reasons", string(message.StopReason)),
+			attribute.Float64("gen_ai.client.operation.duration_s", callDuration.Seconds()),
+		)
+		chatSpan.End()
 
 		// Separate text blocks and tool-use blocks.
 		var textContent strings.Builder
@@ -314,7 +388,7 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 			totalToolCalls++
 			log.Printf("tool_use [%d]: %s id=%s", totalToolCalls, tu.Name, tu.ID)
 
-			result := executeToolCall(tu.Name, string(tu.Input))
+			result := executeToolCall(ctx, tu.Name, string(tu.Input))
 			isErr := strings.HasPrefix(result, "Error:")
 			resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(tu.ID, result, isErr))
 		}
@@ -377,6 +451,17 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 	totalToolCalls := 0
 
 	for i := 0; i < maxToolIterations; i++ {
+		// Start a gen_ai.chat span for this LLM API call.
+		iterCtx, chatSpan := agentTracer.Start(ctx, "gen_ai.chat",
+			trace.WithSpanKind(trace.SpanKindClient),
+			trace.WithAttributes(
+				attribute.String("gen_ai.system", provider),
+				attribute.String("gen_ai.request.model", model),
+				attribute.Int("gen_ai.chat.iteration", i+1),
+			),
+		)
+
+		callStart := time.Now()
 		params := openai.ChatCompletionNewParams{
 			Model:    openai.ChatModel(model),
 			Messages: messages,
@@ -385,8 +470,12 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 			params.Tools = oaiTools
 		}
 
-		completion, err := client.Chat.Completions.New(ctx, params)
+		completion, err := client.Chat.Completions.New(iterCtx, params)
+		callDuration := time.Since(callStart)
 		if err != nil {
+			chatSpan.RecordError(err)
+			chatSpan.SetStatus(codes.Error, "openai api error")
+			chatSpan.End()
 			var apiErr *openai.Error
 			if errors.As(err, &apiErr) {
 				return "", totalInputTokens, totalOutputTokens, totalToolCalls,
@@ -396,8 +485,22 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 				fmt.Errorf("OpenAI API error: %w", err)
 		}
 
-		totalInputTokens += int(completion.Usage.PromptTokens)
-		totalOutputTokens += int(completion.Usage.CompletionTokens)
+		inTok := int(completion.Usage.PromptTokens)
+		outTok := int(completion.Usage.CompletionTokens)
+		totalInputTokens += inTok
+		totalOutputTokens += outTok
+
+		finishReason := ""
+		if len(completion.Choices) > 0 {
+			finishReason = string(completion.Choices[0].FinishReason)
+		}
+		chatSpan.SetAttributes(
+			attribute.Int("gen_ai.usage.input_tokens", inTok),
+			attribute.Int("gen_ai.usage.output_tokens", outTok),
+			attribute.String("gen_ai.response.finish_reasons", finishReason),
+			attribute.Float64("gen_ai.client.operation.duration_s", callDuration.Seconds()),
+		)
+		chatSpan.End()
 
 		if len(completion.Choices) == 0 {
 			return "", totalInputTokens, totalOutputTokens, totalToolCalls,
@@ -416,7 +519,7 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 				totalToolCalls++
 				log.Printf("tool_call [%d]: %s id=%s", totalToolCalls, fc.Function.Name, fc.ID)
 
-				result := executeToolCall(fc.Function.Name, fc.Function.Arguments)
+				result := executeToolCall(ctx, fc.Function.Name, fc.Function.Arguments)
 				messages = append(messages, openai.ToolMessage(result, fc.ID))
 			}
 			continue

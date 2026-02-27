@@ -1,17 +1,23 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/html"
 )
 
@@ -193,32 +199,55 @@ func defaultTools() []ToolDef {
 }
 
 // executeToolCall dispatches a tool call and returns the result string.
-func executeToolCall(name string, argsJSON string) string {
+func executeToolCall(ctx context.Context, name string, argsJSON string) string {
+	toolStart := time.Now()
+	ctx, span := agentTracer.Start(ctx, "tool.execute",
+		trace.WithAttributes(
+			attribute.String("tool.name", name),
+		),
+	)
+	defer func() {
+		span.SetAttributes(
+			attribute.Int64("tool.duration_ms", time.Since(toolStart).Milliseconds()),
+		)
+		span.End()
+	}()
+
 	log.Printf("tool call: %s args=%s", name, truncateStr(argsJSON, 200))
 
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		span.SetAttributes(attribute.Bool("tool.success", false))
 		return fmt.Sprintf("Error parsing tool arguments: %v", err)
 	}
 
+	var result string
 	switch name {
 	case ToolExecuteCommand:
-		return executeCommand(args)
+		result = executeCommand(ctx, args)
 	case ToolReadFile:
-		return readFileTool(args)
+		result = readFileTool(args)
 	case ToolWriteFile:
-		return writeFileTool(args)
+		result = writeFileTool(args)
 	case ToolListDirectory:
-		return listDirectoryTool(args)
+		result = listDirectoryTool(args)
 	case ToolSendChannelMessage:
-		return sendChannelMessageTool(args)
+		result = sendChannelMessageTool(args)
 	case ToolFetchURL:
-		return fetchURLTool(args)
+		result = fetchURLTool(ctx, span, args)
 	case ToolScheduleTask:
-		return scheduleTaskTool(args)
+		result = scheduleTaskTool(args)
 	default:
+		span.SetAttributes(attribute.Bool("tool.success", false))
 		return fmt.Sprintf("Unknown tool: %s", name)
 	}
+
+	isErr := strings.HasPrefix(result, "Error")
+	span.SetAttributes(attribute.Bool("tool.success", !isErr))
+	if isErr {
+		span.SetStatus(codes.Error, truncateStr(result, 200))
+	}
+	return result
 }
 
 // --- Native tools (run in the agent container) ---
@@ -332,13 +361,19 @@ func sendChannelMessageTool(args map[string]any) string {
 // fetchURLTool fetches a URL and returns the content as readable text.
 // HTML pages are converted to plain text by stripping tags.
 // JSON responses are returned as-is.
-func fetchURLTool(args map[string]any) string {
+func fetchURLTool(ctx context.Context, parentSpan trace.Span, args map[string]any) string {
 	rawURL, _ := args["url"].(string)
 	if rawURL == "" {
 		return "Error: 'url' is required"
 	}
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
 		return "Error: url must start with http:// or https://"
+	}
+
+	// Set sanitized URL (strip query params) on the parent tool.execute span.
+	if parsed, err := url.Parse(rawURL); err == nil {
+		sanitized := fmt.Sprintf("%s://%s%s", parsed.Scheme, parsed.Host, parsed.Path)
+		parentSpan.SetAttributes(attribute.String("url.full", sanitized))
 	}
 
 	maxChars := 50_000
@@ -380,6 +415,8 @@ func fetchURLTool(args map[string]any) string {
 		return fmt.Sprintf("Error fetching URL: %v", err)
 	}
 	defer resp.Body.Close()
+
+	parentSpan.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2000))
@@ -617,7 +654,7 @@ type execResult struct {
 	TimedOut bool   `json:"timedOut,omitempty"`
 }
 
-func executeCommand(args map[string]any) string {
+func executeCommand(ctx context.Context, args map[string]any) string {
 	command, _ := args["command"].(string)
 	if command == "" {
 		return "Error: 'command' is required"
@@ -637,6 +674,22 @@ func executeCommand(args map[string]any) string {
 	}
 
 	id := fmt.Sprintf("%d", time.Now().UnixNano())
+
+	// Start an IPC request span.
+	_, ipcSpan := agentTracer.Start(ctx, "ipc.exec_request",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("ipc.request_id", id),
+			attribute.Int("ipc.timeout_s", timeoutSec),
+		),
+	)
+	ipcStart := time.Now()
+	defer func() {
+		ipcSpan.SetAttributes(
+			attribute.Int64("ipc.wait_duration_ms", time.Since(ipcStart).Milliseconds()),
+		)
+		ipcSpan.End()
+	}()
 
 	req := execRequest{
 		ID:      id,
@@ -659,6 +712,9 @@ func executeCommand(args map[string]any) string {
 	if err := os.WriteFile(reqPath, data, 0o644); err != nil {
 		return fmt.Sprintf("Error writing exec request: %v", err)
 	}
+
+	// Write context file alongside the request for future sidecar use.
+	writeTraceContext(ctx, toolsDir, id)
 
 	log.Printf("Wrote exec request %s: %s", id, truncateStr(command, 120))
 
@@ -685,6 +741,8 @@ func executeCommand(args map[string]any) string {
 
 			_ = os.Remove(reqPath)
 			_ = os.Remove(resPath)
+			// Clean up context file too.
+			_ = os.Remove(filepath.Join(toolsDir, fmt.Sprintf("context-%s.json", id)))
 
 			return formatExecResult(result)
 		}
@@ -692,6 +750,29 @@ func executeCommand(args map[string]any) string {
 	}
 
 	return "Error: timed out waiting for command execution result. The skill sidecar may not be running."
+}
+
+// writeTraceContext writes a context-<id>.json file with W3C trace context
+// for skill sidecars that may want to continue the trace.
+func writeTraceContext(ctx context.Context, dir, id string) {
+	carrier := propagation.MapCarrier{}
+	propagation.TraceContext{}.Inject(ctx, carrier)
+	tp := carrier.Get("traceparent")
+	if tp == "" {
+		return
+	}
+	ctxFile := struct {
+		Traceparent string `json:"traceparent"`
+		Tracestate  string `json:"tracestate"`
+	}{
+		Traceparent: tp,
+		Tracestate:  carrier.Get("tracestate"),
+	}
+	data, err := json.Marshal(ctxFile)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, fmt.Sprintf("context-%s.json", id)), data, 0o644)
 }
 
 func formatExecResult(r execResult) string {
