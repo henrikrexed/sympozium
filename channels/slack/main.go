@@ -216,10 +216,15 @@ func (sc *SlackChannel) readSocketMode(ctx context.Context, conn *websocket.Conn
 			return err
 		}
 
+		sc.log.Info("WebSocket message received", "raw", string(raw))
+
 		var env socketEnvelope
 		if err := json.Unmarshal(raw, &env); err != nil {
+			sc.log.Error(err, "failed to unmarshal envelope")
 			continue
 		}
+
+		sc.log.Info("Envelope parsed", "type", env.Type, "envelopeID", env.EnvelopeID)
 
 		switch env.Type {
 		case "hello":
