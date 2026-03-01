@@ -533,6 +533,10 @@ spec:
 - **Runs page** (`/runs`): collector status, run totals, token totals, tool-invocation totals, model token breakdown.
 - **Run detail** (`/runs/<name>`) → **Telemetry tab**: run timeline events, trace correlation fields, and observed telemetry metric names.
 
+<p align="center">
+  <img src="otel.png" alt="Sympozium observability dashboard showing token usage and tool call metrics" width="900px;">
+</p>
+
 For full distributed trace waterfall views, configure collector exporters to your preferred backend (Jaeger, Tempo, Datadog, Honeycomb, etc.).
 
 ## Interactive TUI
