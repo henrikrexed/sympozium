@@ -62,9 +62,17 @@ type AgentRunReconciler struct {
 	RunHistoryLimit int    // max completed runs to keep per instance (0 = use default)
 }
 
-const imageRegistry = "ghcr.io/alexsjones/sympozium"
+// imageRegistry is configurable via SYMPOZIUM_IMAGE_REGISTRY env var.
+var imageRegistry = getImageRegistry()
 
 // imageRef returns a fully qualified image reference using the reconciler's tag.
+func getImageRegistry() string {
+	if reg := os.Getenv("SYMPOZIUM_IMAGE_REGISTRY"); reg != "" {
+		return reg
+	}
+	return "ghcr.io/alexsjones/sympozium"
+}
+
 func (r *AgentRunReconciler) imageRef(name string) string {
 	tag := r.ImageTag
 	if tag == "" {
