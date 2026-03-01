@@ -36,6 +36,11 @@ jobs:
           - apiserver
           - ipc-bridge
           - webhook
+          - channel-slack
+          - channel-discord
+          - channel-telegram
+          - channel-whatsapp
+          - skill-k8s-ops
     steps:
       - uses: actions/checkout@v4
 
