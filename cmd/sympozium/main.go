@@ -525,14 +525,18 @@ func runOnboard() error {
 				fmt.Printf("  ✓ Using %s from environment\n", secretEnvKey)
 			}
 		}
-		if apiKey == "" {
-			fmt.Println("  ⚠  No API key provided — you can add it later:")
-			fmt.Printf("  kubectl create secret generic %s-%s-key --from-literal=%s=<key>\n",
-				instanceName, providerName, secretEnvKey)
-		}
 	}
 
 	providerSecretName := fmt.Sprintf("%s-%s-key", instanceName, providerName)
+	if secretEnvKey != "" && apiKey == "" {
+		// Standalone onboarding requires a provider secret before completing.
+		// If the user skipped key entry, allow using a pre-existing secret.
+		if err := kubectlQuiet("get", "secret", providerSecretName, "-n", namespace); err != nil {
+			return fmt.Errorf("provider secret %q is required before creating instance %q; create it with: kubectl create secret generic %s -n %s --from-literal=%s=<key>",
+				providerSecretName, instanceName, providerSecretName, namespace, secretEnvKey)
+		}
+		fmt.Printf("  ✓ Using existing provider secret %s\n", providerSecretName)
+	}
 
 	// ── Step 4: Channel ──────────────────────────────────────────────────
 	fmt.Println("\n📋 Step 4/6 — Connect a Channel (optional)")
@@ -668,10 +672,10 @@ func runOnboard() error {
 
 	// 4. Create SympoziumInstance.
 	fmt.Printf("  Creating SympoziumInstance %s...\n", instanceName)
-	// Only pass the secret name if an API key was provided.
-	instanceSecret := providerSecretName
-	if apiKey == "" {
-		instanceSecret = ""
+	// Provider secret is required (except providers that do not need keys, e.g. ollama).
+	instanceSecret := ""
+	if secretEnvKey != "" {
+		instanceSecret = providerSecretName
 	}
 	// WhatsApp doesn't need a channel secret (QR pairing)
 	chSecret := channelSecretName
@@ -683,6 +687,19 @@ func runOnboard() error {
 		policyName, applyPolicy)
 	if err := kubectlApplyStdin(instanceYAML); err != nil {
 		return fmt.Errorf("apply instance: %w", err)
+	}
+	if secretEnvKey != "" {
+		if err := kubectlQuiet("get", "secret", providerSecretName, "-n", namespace); err != nil {
+			return fmt.Errorf("provider secret %q not found after apply: %w", providerSecretName, err)
+		}
+		checkAuth := fmt.Sprintf("{.spec.authRefs[?(@.secret==%q)].secret}", providerSecretName)
+		out, err := exec.Command("kubectl", "get", "sympoziuminstance", instanceName, "-n", namespace, "-o", "jsonpath="+checkAuth).Output()
+		if err != nil {
+			return fmt.Errorf("verify authRef link on instance %q: %w", instanceName, err)
+		}
+		if strings.TrimSpace(string(out)) == "" {
+			return fmt.Errorf("instance %q is missing authRef to secret %q", instanceName, providerSecretName)
+		}
 	}
 
 	// 5. Create heartbeat schedule (unless disabled).
@@ -7696,8 +7713,9 @@ func (m tuiModel) renderWizardPanel(h int) string {
 		if envVal != "" {
 			lines = append(lines, hintStyle.Render(fmt.Sprintf("  Press Enter to use %s from environment.", w.secretEnvKey)))
 		} else {
-			lines = append(lines, hintStyle.Render("  Press Enter to skip — you can add it later."))
+			lines = append(lines, hintStyle.Render(fmt.Sprintf("  Press Enter to use existing secret %s-%s-key in this namespace (if present).", w.instanceName, w.providerName)))
 		}
+		lines = append(lines, hintStyle.Render("  (a provider secret must exist before onboarding can complete)"))
 		lines = append(lines, hintStyle.Render("  (providing a key lets us fetch your available models)"))
 
 	case wizStepModel:
@@ -8406,6 +8424,7 @@ func tuiOnboardApply(ns string, w *wizardState) (string, error) {
 	policyName := "default-policy"
 
 	// 1. Create AI provider secret.
+	authSecretName := ""
 	if w.apiKey != "" {
 		// Delete existing if present.
 		existing := &corev1.Secret{}
@@ -8419,10 +8438,17 @@ func tuiOnboardApply(ns string, w *wizardState) (string, error) {
 		if err := k8sClient.Create(ctx, secret); err != nil {
 			return "", fmt.Errorf("create provider secret: %w", err)
 		}
+		authSecretName = providerSecretName
 		msgs = append(msgs, tuiSuccessStyle.Render(fmt.Sprintf("✓ Created secret: %s", providerSecretName)))
 	} else if w.secretEnvKey != "" {
-		msgs = append(msgs, tuiDimStyle.Render(fmt.Sprintf("⚠ No API key — create secret later: kubectl create secret generic %s --from-literal=%s=<key>",
-			providerSecretName, w.secretEnvKey)))
+		// Standalone instance onboarding must not complete without an auth secret.
+		existing := &corev1.Secret{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: providerSecretName, Namespace: ns}, existing); err != nil {
+			return "", fmt.Errorf("provider secret %q is required before creating instance %q; provide %s in the wizard or create secret %q in namespace %q",
+				providerSecretName, w.instanceName, w.secretEnvKey, providerSecretName, ns)
+		}
+		authSecretName = providerSecretName
+		msgs = append(msgs, tuiDimStyle.Render(fmt.Sprintf("ℹ Using existing provider secret: %s", providerSecretName)))
 	}
 
 	// 2. Create channel secret.
@@ -8504,11 +8530,12 @@ func tuiOnboardApply(ns string, w *wizardState) (string, error) {
 		},
 	}
 
-	// Only add AuthRefs when an API key was provided.
-	if w.apiKey != "" {
+	// Link auth for providers that require an API key.
+	if w.secretEnvKey != "" {
 		inst.Spec.AuthRefs = []sympoziumv1alpha1.SecretRef{
 			{
-				Secret: providerSecretName,
+				Provider: w.providerName,
+				Secret:   providerSecretName,
 			},
 		}
 	}
@@ -8565,6 +8592,25 @@ func tuiOnboardApply(ns string, w *wizardState) (string, error) {
 		}
 	} else {
 		msgs = append(msgs, tuiSuccessStyle.Render(fmt.Sprintf("✓ Created SympoziumInstance: %s", w.instanceName)))
+	}
+	if w.secretEnvKey != "" {
+		if authSecretName == "" {
+			return "", fmt.Errorf("internal error: provider secret name not resolved for %q", w.instanceName)
+		}
+		linked := false
+		for _, ref := range inst.Spec.AuthRefs {
+			if ref.Secret == authSecretName {
+				linked = true
+				break
+			}
+		}
+		if !linked {
+			return "", fmt.Errorf("instance %q was created without authRef to provider secret %q", w.instanceName, authSecretName)
+		}
+		existing := &corev1.Secret{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: authSecretName, Namespace: ns}, existing); err != nil {
+			return "", fmt.Errorf("provider secret %q not found after instance apply: %w", authSecretName, err)
+		}
 	}
 
 	// 5. Create a heartbeat schedule (unless disabled).
