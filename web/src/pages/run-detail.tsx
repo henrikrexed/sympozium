@@ -1,5 +1,6 @@
 import { useParams, Link } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useRun } from "@/hooks/use-api";
 import { StatusBadge } from "@/components/status-badge";
 import {
@@ -123,7 +124,7 @@ export function RunDetailPage() {
             <CardContent className="pt-6">
               {run.status?.result ? (
                 <div className="prose prose-sm prose-invert max-w-none">
-                  <ReactMarkdown>{run.status.result}</ReactMarkdown>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{run.status.result}</ReactMarkdown>
                 </div>
               ) : run.status?.error ? (
                 <div className="space-y-2">

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useInstances, useCreateRun, useRuns } from "@/hooks/use-api";
 import { useWebSocket, type StreamEvent } from "@/hooks/use-websocket";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -376,7 +377,7 @@ function FeedBubble({ item }: { item: FeedItem }) {
           <p className="whitespace-pre-wrap break-words">{item.text}</p>
         ) : (
           <div className="prose prose-sm prose-invert prose-feed break-words max-w-none">
-            <ReactMarkdown>{item.text}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.text}</ReactMarkdown>
           </div>
         )}
         {item.meta && (
