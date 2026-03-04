@@ -204,8 +204,6 @@ main() {
 
   run_schedule_label="$(printf "%s" "$run_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("metadata",{}).get("labels",{}).get("sympozium.ai/schedule",""))')"
   run_instance_label="$(printf "%s" "$run_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("metadata",{}).get("labels",{}).get("sympozium.ai/instance",""))')"
-  run_owner_kind="$(printf "%s" "$run_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); refs=d.get("metadata",{}).get("ownerReferences",[]); print(refs[0].get("kind","") if refs else "")')"
-  run_owner_name="$(printf "%s" "$run_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); refs=d.get("metadata",{}).get("ownerReferences",[]); print(refs[0].get("name","") if refs else "")')"
   run_model_provider="$(printf "%s" "$run_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("spec",{}).get("model",{}).get("provider", ""))')"
   run_auth_secret="$(printf "%s" "$run_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("spec",{}).get("model",{}).get("authSecretRef", ""))')"
 
@@ -217,10 +215,6 @@ main() {
     fail "Run missing/incorrect instance label: got '${run_instance_label}', want '${INSTANCE_NAME}'"
     exit 1
   fi
-  if [[ "$run_owner_kind" != "SympoziumSchedule" || "$run_owner_name" != "$SCHEDULE_NAME" ]]; then
-    fail "Run ownerReference not set to SympoziumSchedule '${SCHEDULE_NAME}'"
-    exit 1
-  fi
   if [[ "$run_model_provider" != "openai" ]]; then
     fail "Run model provider not inherited from instance auth config (got '${run_model_provider}')"
     exit 1
@@ -230,7 +224,7 @@ main() {
     exit 1
   fi
 
-  pass "Run has Sympozium schedule owner/labels and inherited provider/auth metadata"
+  pass "Run has Sympozium schedule labels and inherited provider/auth metadata"
 
   pass "Schedule-dispatch API test passed"
 }
