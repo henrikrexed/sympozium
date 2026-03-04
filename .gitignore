@@ -46,3 +46,11 @@ web/node_modules/
 output.cast
 tmp.gif
 whatsapp
+
+# BMAD workflow files
+_bmad/
+_bmad-output/
+.claude/
+
+# MCP bridge binary
+/mcp-bridge

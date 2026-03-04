@@ -1,0 +1,65 @@
+// Package main is the entry point for the Sympozium MCP bridge sidecar.
+// It runs inside agent pods and translates between file-based IPC
+// and remote MCP servers via JSON-RPC 2.0 Streamable HTTP.
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/alexsjones/sympozium/internal/mcpbridge"
+)
+
+func main() {
+	configPath := envOrDefault("MCP_CONFIG_PATH", "/config/mcp-servers.yaml")
+	ipcPath := envOrDefault("MCP_IPC_PATH", "/ipc/tools")
+	manifestPath := envOrDefault("MCP_MANIFEST_PATH", "/ipc/tools/mcp-tools.json")
+	agentRunID := os.Getenv("AGENT_RUN_ID")
+	debug := os.Getenv("DEBUG") == "true"
+
+	if debug {
+		log.SetFlags(log.LstdFlags | log.Lshortfile)
+	}
+
+	log.Printf("MCP bridge starting (config=%s ipc=%s agentRunID=%s)", configPath, ipcPath, agentRunID)
+
+	// Load and validate configuration
+	cfg, err := mcpbridge.LoadConfig(configPath)
+	if err != nil {
+		log.Printf("Failed to load config: %v", err)
+		log.Printf("No MCP servers configured, exiting gracefully")
+		os.Exit(0)
+	}
+
+	if err := mcpbridge.ValidateConfig(cfg); err != nil {
+		log.Fatalf("Invalid MCP config: %v", err)
+	}
+
+	if len(cfg.Servers) == 0 {
+		log.Printf("No MCP servers configured, exiting gracefully")
+		os.Exit(0)
+	}
+
+	log.Printf("Loaded %d MCP server(s) from config", len(cfg.Servers))
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	bridge := mcpbridge.NewBridge(cfg, ipcPath, manifestPath, agentRunID)
+
+	if err := bridge.Run(ctx); err != nil {
+		log.Fatalf("MCP bridge failed: %v", err)
+	}
+
+	log.Printf("MCP bridge exiting")
+}
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}

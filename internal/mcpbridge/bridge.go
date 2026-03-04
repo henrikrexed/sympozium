@@ -1,0 +1,297 @@
+package mcpbridge
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+)
+
+// maxConcurrent is the maximum number of concurrent MCP requests.
+const maxConcurrent = 10
+
+// Bridge is the MCP bridge sidecar process.
+type Bridge struct {
+	config       *ServersConfig
+	ipcPath      string
+	manifestPath string
+	agentRunID   string
+	clients      map[string]*Client // server name -> client
+	toolIndex    map[string]string  // prefixed tool name -> server name
+	prefixIndex  map[string]string  // tools prefix -> server name
+	processed    sync.Map           // dedup fsnotify events
+}
+
+// NewBridge creates a new MCP bridge.
+func NewBridge(cfg *ServersConfig, ipcPath, manifestPath, agentRunID string) *Bridge {
+	prefixIdx := make(map[string]string, len(cfg.Servers))
+	for _, s := range cfg.Servers {
+		prefixIdx[s.ToolsPrefix] = s.Name
+	}
+
+	return &Bridge{
+		config:       cfg,
+		ipcPath:      ipcPath,
+		manifestPath: manifestPath,
+		agentRunID:   agentRunID,
+		clients:      make(map[string]*Client),
+		toolIndex:    make(map[string]string),
+		prefixIndex:  prefixIdx,
+	}
+}
+
+// Run starts the MCP bridge: discovers tools, writes manifest, then watches for requests.
+func (b *Bridge) Run(ctx context.Context) error {
+	// Phase 1: Connect to MCP servers and discover tools
+	manifest, err := b.discoverTools(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Phase 2: Write tool manifest for agent-runner
+	if err := WriteManifest(b.manifestPath, manifest); err != nil {
+		return err
+	}
+
+	log.Printf("Wrote tool manifest with %d tools to %s", len(manifest.Tools), b.manifestPath)
+
+	// Phase 3: Watch for MCP requests and dispatch
+	return b.watchAndDispatch(ctx)
+}
+
+// watchAndDispatch watches the IPC tools directory for MCP request files
+// and dispatches them to the appropriate MCP server.
+func (b *Bridge) watchAndDispatch(ctx context.Context) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("creating fsnotify watcher: %w", err)
+	}
+	defer watcher.Close()
+
+	if err := os.MkdirAll(b.ipcPath, 0o755); err != nil {
+		return fmt.Errorf("creating IPC directory: %w", err)
+	}
+
+	if err := watcher.Add(b.ipcPath); err != nil {
+		return fmt.Errorf("watching IPC directory: %w", err)
+	}
+
+	log.Printf("Watching %s for MCP requests", b.ipcPath)
+
+	// Semaphore for concurrency control
+	sem := make(chan struct{}, maxConcurrent)
+
+	// Also watch for agent completion (result.json in parent /ipc/output/)
+	outputDir := filepath.Join(filepath.Dir(b.ipcPath), "output")
+	_ = watcher.Add(outputDir) // best-effort; dir may not exist yet
+
+	var wg sync.WaitGroup
+
+	for {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return nil
+
+		case event, ok := <-watcher.Events:
+			if !ok {
+				wg.Wait()
+				return nil
+			}
+
+			filename := filepath.Base(event.Name)
+
+			// Exit when agent completes
+			if filename == "result.json" && filepath.Dir(event.Name) == outputDir {
+				log.Printf("Agent completed (result.json detected), draining in-flight requests")
+				wg.Wait()
+				return nil
+			}
+
+			// Only process mcp-request-*.json files
+			if !event.Has(fsnotify.Create) && !event.Has(fsnotify.Write) {
+				continue
+			}
+			if !strings.HasPrefix(filename, "mcp-request-") || !strings.HasSuffix(filename, ".json") {
+				continue
+			}
+
+			// Dedup: fsnotify fires both Create and Write
+			if _, loaded := b.processed.LoadOrStore(event.Name, true); loaded {
+				continue
+			}
+
+			sem <- struct{}{} // acquire
+			wg.Add(1)
+			go func(path string) {
+				defer wg.Done()
+				defer func() { <-sem }() // release
+				b.handleRequest(ctx, path)
+				b.processed.Delete(path)
+			}(event.Name)
+
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				wg.Wait()
+				return nil
+			}
+			log.Printf("Watcher error: %v", err)
+		}
+	}
+}
+
+// handleRequest processes a single MCP request file.
+func (b *Bridge) handleRequest(ctx context.Context, path string) {
+	// Small delay to ensure file write is complete
+	time.Sleep(50 * time.Millisecond)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("Failed to read request %s: %v", path, err)
+		return
+	}
+
+	var req MCPRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		log.Printf("Failed to parse request %s: %v", path, err)
+		b.writeErrorResult(req.ID, path, "invalid request JSON")
+		return
+	}
+
+	// Resolve target server
+	serverName := req.Server
+	toolName := req.Tool
+
+	if serverName == "" {
+		// Resolve by prefix: find the longest matching prefix
+		serverName, toolName = b.resolveByPrefix(req.Tool)
+		if serverName == "" {
+			log.Printf("No server found for tool %q", req.Tool)
+			b.writeErrorResult(req.ID, path, fmt.Sprintf("no MCP server found for tool %q", req.Tool))
+			return
+		}
+	} else {
+		// Server specified directly — still strip prefix from tool name
+		_, toolName = b.resolveByPrefix(req.Tool)
+		if toolName == req.Tool {
+			// No prefix found — use as-is
+			toolName = req.Tool
+		}
+	}
+
+	client, ok := b.clients[serverName]
+	if !ok {
+		log.Printf("No client for server %q", serverName)
+		b.writeErrorResult(req.ID, path, fmt.Sprintf("MCP server %q not connected", serverName))
+		return
+	}
+
+	// Build meta for trace propagation
+	var meta map[string]any
+	if len(req.Meta) > 0 {
+		meta = make(map[string]any, len(req.Meta))
+		for k, v := range req.Meta {
+			meta[k] = v
+		}
+	}
+
+	// Call the tool
+	log.Printf("Calling MCP tool %q on server %q (request %s)", toolName, serverName, req.ID)
+
+	callResult, err := client.CallTool(ctx, toolName, req.Arguments, meta)
+	if err != nil {
+		log.Printf("MCP tool call failed: %v", err)
+		b.writeErrorResult(req.ID, path, err.Error())
+		return
+	}
+
+	// Build result
+	result := MCPResult{
+		ID:      req.ID,
+		Success: !callResult.IsError,
+		IsError: callResult.IsError,
+	}
+
+	if callResult.IsError {
+		// Extract error text from content
+		for _, c := range callResult.Content {
+			if c.Text != "" {
+				result.Error = c.Text
+				break
+			}
+		}
+	}
+
+	// Marshal content
+	contentData, _ := json.Marshal(callResult.Content)
+	result.Content = contentData
+
+	b.writeResult(req.ID, path, &result)
+}
+
+// resolveByPrefix finds the server for a prefixed tool name and returns
+// the server name and the unprefixed tool name.
+func (b *Bridge) resolveByPrefix(prefixedTool string) (serverName, toolName string) {
+	// Check the exact tool index first
+	if sn, ok := b.toolIndex[prefixedTool]; ok {
+		// Strip prefix: find the prefix for this server and remove it + "_"
+		for _, srv := range b.config.Servers {
+			if srv.Name == sn && strings.HasPrefix(prefixedTool, srv.ToolsPrefix+"_") {
+				return sn, strings.TrimPrefix(prefixedTool, srv.ToolsPrefix+"_")
+			}
+		}
+		return sn, prefixedTool
+	}
+
+	// Fall back to prefix matching (for tools discovered after startup)
+	for prefix, sn := range b.prefixIndex {
+		if strings.HasPrefix(prefixedTool, prefix+"_") {
+			return sn, strings.TrimPrefix(prefixedTool, prefix+"_")
+		}
+	}
+
+	return "", prefixedTool
+}
+
+// writeResult writes an MCPResult to the result file.
+func (b *Bridge) writeResult(id, reqPath string, result *MCPResult) {
+	resPath := strings.Replace(reqPath, "mcp-request-", "mcp-result-", 1)
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		log.Printf("Failed to marshal result for %s: %v", id, err)
+		return
+	}
+
+	// Write atomically
+	tmp := resPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		log.Printf("Failed to write result for %s: %v", id, err)
+		return
+	}
+	if err := os.Rename(tmp, resPath); err != nil {
+		log.Printf("Failed to rename result for %s: %v", id, err)
+		os.Remove(tmp)
+		return
+	}
+
+	// Clean up request file
+	os.Remove(reqPath)
+}
+
+// writeErrorResult writes an error MCPResult.
+func (b *Bridge) writeErrorResult(id, reqPath, errMsg string) {
+	result := &MCPResult{
+		ID:      id,
+		Success: false,
+		Error:   errMsg,
+	}
+	b.writeResult(id, reqPath, result)
+}
