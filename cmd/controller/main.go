@@ -50,7 +50,7 @@ func main() {
 	flag.IntVar(&maxRunHistory, "max-run-history", controller.DefaultRunHistoryLimit,
 		"Maximum number of completed AgentRuns to keep per instance before pruning oldest.")
 	flag.Parse()
-	n // Allow env overrides for image registry and tag.
+	// Allow env overrides for image registry and tag.
 	if v := os.Getenv("IMAGE_TAG"); v != "" {
 		imageTag = v
 	}
