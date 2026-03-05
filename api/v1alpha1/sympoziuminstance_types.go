@@ -37,6 +37,45 @@ type SympoziumInstanceSpec struct {
 	// When nil, inherits from Helm chart global values.
 	// +optional
 	Observability *ObservabilitySpec `json:"observability,omitempty"`
+
+	// MCPServers configures remote MCP (Model Context Protocol) servers
+	// that agents in this instance can access via the mcp-bridge sidecar.
+	// +optional
+	MCPServers []MCPServerRef `json:"mcpServers,omitempty"`
+}
+
+// MCPServerRef references a remote MCP server for tool integration.
+type MCPServerRef struct {
+	// Name is a unique identifier for this MCP server connection.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// URL is the MCP server's Streamable HTTP endpoint.
+	// +kubebuilder:validation:MinLength=1
+	URL string `json:"url"`
+
+	// ToolsPrefix is prepended to tool names from this server to avoid collisions.
+	// Must be unique across all configured servers.
+	// +kubebuilder:validation:MinLength=1
+	ToolsPrefix string `json:"toolsPrefix"`
+
+	// Timeout is the per-request timeout in seconds for this server.
+	// +kubebuilder:default=30
+	// +optional
+	Timeout int `json:"timeout,omitempty"`
+
+	// AuthSecret references a Kubernetes Secret containing auth credentials.
+	// The key specified by AuthKey (default "token") is used as a Bearer token.
+	// +optional
+	AuthSecret string `json:"authSecret,omitempty"`
+
+	// AuthKey is the key within AuthSecret to use. Defaults to "token".
+	// +optional
+	AuthKey string `json:"authKey,omitempty"`
+
+	// Headers are additional HTTP headers to send with every request.
+	// +optional
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // MemorySpec configures persistent memory for a SympoziumInstance.

@@ -232,6 +232,7 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	instance := &sympoziumv1alpha1.SympoziumInstance{}
 	memoryEnabled := false
 	var observability *sympoziumv1alpha1.ObservabilitySpec
+	var mcpServers []sympoziumv1alpha1.MCPServerRef
 	if err := r.Get(ctx, client.ObjectKey{
 		Namespace: agentRun.Namespace,
 		Name:      agentRun.Spec.InstanceRef,
@@ -254,6 +255,14 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 		// should already copy skills, but older runs or manual CRs may not.
 		if len(agentRun.Spec.Skills) == 0 && len(instance.Spec.Skills) > 0 {
 			agentRun.Spec.Skills = instance.Spec.Skills
+		}
+		mcpServers = instance.Spec.MCPServers
+	}
+
+	// Create MCP ConfigMap if MCP servers are configured.
+	if len(mcpServers) > 0 {
+		if err := r.ensureMCPConfigMap(ctx, agentRun, mcpServers); err != nil {
+			log.Error(err, "Failed to create MCP ConfigMap")
 		}
 	}
 
@@ -281,7 +290,7 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	}
 
 	// Build and create the Job
-	job := r.buildJob(agentRun, memoryEnabled, observability, sidecars)
+	job := r.buildJob(agentRun, memoryEnabled, observability, sidecars, mcpServers)
 	if err := controllerutil.SetControllerReference(agentRun, job, r.Scheme); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting owner reference: %w", err)
 	}
@@ -659,6 +668,7 @@ func (r *AgentRunReconciler) buildJob(
 	memoryEnabled bool,
 	observability *sympoziumv1alpha1.ObservabilitySpec,
 	sidecars []resolvedSidecar,
+	mcpServers []sympoziumv1alpha1.MCPServerRef,
 ) *batchv1.Job {
 	labels := map[string]string{
 		"sympozium.ai/agent-run": agentRun.Name,
@@ -674,8 +684,8 @@ func (r *AgentRunReconciler) buildJob(
 	backoffLimit := int32(0)
 
 	// Build containers
-	containers := r.buildContainers(agentRun, memoryEnabled, observability, sidecars)
-	volumes := r.buildVolumes(agentRun, memoryEnabled, sidecars)
+	containers := r.buildContainers(agentRun, memoryEnabled, observability, sidecars, mcpServers)
+	volumes := r.buildVolumes(agentRun, memoryEnabled, sidecars, mcpServers)
 	hostNetwork, hostPID := derivePodHostAccess(sidecars)
 	dnsPolicy := corev1.DNSClusterFirst
 	if hostNetwork {
@@ -726,6 +736,7 @@ func (r *AgentRunReconciler) buildContainers(
 	memoryEnabled bool,
 	observability *sympoziumv1alpha1.ObservabilitySpec,
 	sidecars []resolvedSidecar,
+	mcpServers []sympoziumv1alpha1.MCPServerRef,
 ) []corev1.Container {
 	readOnly := true
 	noPrivEsc := false
@@ -894,6 +905,71 @@ func (r *AgentRunReconciler) buildContainers(
 				Limits: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("500m"),
 					corev1.ResourceMemory: resource.MustParse("512Mi"),
+				},
+			},
+		})
+	}
+
+	// Add MCP bridge sidecar if MCP servers are configured.
+	if len(mcpServers) > 0 {
+		mcpEnv := []corev1.EnvVar{
+			{Name: "AGENT_RUN_ID", Value: agentRun.Name},
+			{Name: "MCP_CONFIG_PATH", Value: "/config/mcp-servers.yaml"},
+			{Name: "MCP_IPC_PATH", Value: "/ipc/tools"},
+			{Name: "MCP_MANIFEST_PATH", Value: "/ipc/tools/mcp-tools.json"},
+		}
+		if tp := agentRun.Annotations["otel.dev/traceparent"]; tp != "" {
+			mcpEnv = append(mcpEnv, corev1.EnvVar{Name: "TRACEPARENT", Value: tp})
+		}
+		if observability != nil && observability.Enabled {
+			mcpEnv = append(mcpEnv, buildObservabilityEnv(agentRun, observability)...)
+		}
+		// Inject auth secrets as env vars for each MCP server.
+		for _, srv := range mcpServers {
+			if srv.AuthSecret == "" {
+				continue
+			}
+			envName := fmt.Sprintf("MCP_AUTH_%s", strings.ToUpper(strings.ReplaceAll(srv.Name, "-", "_")))
+			key := srv.AuthKey
+			if key == "" {
+				key = "token"
+			}
+			mcpEnv = append(mcpEnv, corev1.EnvVar{
+				Name: envName,
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: srv.AuthSecret},
+						Key:                  key,
+						Optional:             boolPtr(true),
+					},
+				},
+			})
+		}
+
+		containers = append(containers, corev1.Container{
+			Name:            "mcp-bridge",
+			Image:           r.imageRef("mcp-bridge"),
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			SecurityContext: &corev1.SecurityContext{
+				ReadOnlyRootFilesystem:   &readOnly,
+				AllowPrivilegeEscalation: &noPrivEsc,
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+			},
+			Env: mcpEnv,
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "ipc", MountPath: "/ipc"},
+				{Name: "mcp-config", MountPath: "/config", ReadOnly: true},
+			},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("128Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("200m"),
+					corev1.ResourceMemory: resource.MustParse("256Mi"),
 				},
 			},
 		})
@@ -1097,7 +1173,7 @@ func buildObservabilityEnv(agentRun *sympoziumv1alpha1.AgentRun, obs *sympoziumv
 }
 
 // buildVolumes constructs the volume list for an agent pod.
-func (r *AgentRunReconciler) buildVolumes(agentRun *sympoziumv1alpha1.AgentRun, memoryEnabled bool, sidecars []resolvedSidecar) []corev1.Volume {
+func (r *AgentRunReconciler) buildVolumes(agentRun *sympoziumv1alpha1.AgentRun, memoryEnabled bool, sidecars []resolvedSidecar, mcpServers []sympoziumv1alpha1.MCPServerRef) []corev1.Volume {
 	workspaceSizeLimit := resource.MustParse("1Gi")
 	ipcSizeLimit := resource.MustParse("64Mi")
 	tmpSizeLimit := resource.MustParse("256Mi")
@@ -1178,6 +1254,22 @@ func (r *AgentRunReconciler) buildVolumes(agentRun *sympoziumv1alpha1.AgentRun, 
 		cmName := fmt.Sprintf("%s-memory", agentRun.Spec.InstanceRef)
 		volumes = append(volumes, corev1.Volume{
 			Name: "memory",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: cmName,
+					},
+					Optional: boolPtr(true),
+				},
+			},
+		})
+	}
+
+	// Add MCP config volume if MCP servers are configured.
+	if len(mcpServers) > 0 {
+		cmName := fmt.Sprintf("%s-mcp-servers", agentRun.Spec.InstanceRef)
+		volumes = append(volumes, corev1.Volume{
+			Name: "mcp-config",
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{
@@ -1300,6 +1392,71 @@ func (r *AgentRunReconciler) createInputConfigMap(ctx context.Context, agentRun 
 		return err
 	}
 	return nil
+}
+
+// ensureMCPConfigMap creates or updates the ConfigMap with MCP server
+// configuration for the mcp-bridge sidecar.
+func (r *AgentRunReconciler) ensureMCPConfigMap(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun, mcpServers []sympoziumv1alpha1.MCPServerRef) error {
+	cmName := fmt.Sprintf("%s-mcp-servers", agentRun.Spec.InstanceRef)
+
+	// Build the mcp-servers.yaml content.
+	yamlContent := buildMCPServersYAML(mcpServers)
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cmName,
+			Namespace: agentRun.Namespace,
+			Labels: map[string]string{
+				"sympozium.ai/instance":  agentRun.Spec.InstanceRef,
+				"sympozium.ai/component": "mcp-config",
+			},
+		},
+		Data: map[string]string{
+			"mcp-servers.yaml": yamlContent,
+		},
+	}
+
+	if err := controllerutil.SetControllerReference(agentRun, cm, r.Scheme); err != nil {
+		return err
+	}
+
+	if err := r.Create(ctx, cm); err != nil {
+		if errors.IsAlreadyExists(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// buildMCPServersYAML generates the YAML config for the mcp-bridge sidecar.
+func buildMCPServersYAML(mcpServers []sympoziumv1alpha1.MCPServerRef) string {
+	var sb strings.Builder
+	sb.WriteString("servers:\n")
+	for _, srv := range mcpServers {
+		sb.WriteString(fmt.Sprintf("  - name: %s\n", srv.Name))
+		sb.WriteString(fmt.Sprintf("    url: %s\n", srv.URL))
+		sb.WriteString(fmt.Sprintf("    toolsPrefix: %s\n", srv.ToolsPrefix))
+		timeout := srv.Timeout
+		if timeout <= 0 {
+			timeout = 30
+		}
+		sb.WriteString(fmt.Sprintf("    timeout: %d\n", timeout))
+		if srv.AuthSecret != "" {
+			// Reference the env var that will be injected by the container spec.
+			envName := fmt.Sprintf("MCP_AUTH_%s", strings.ToUpper(strings.ReplaceAll(srv.Name, "-", "_")))
+			sb.WriteString("    auth:\n")
+			sb.WriteString(fmt.Sprintf("      type: bearer\n"))
+			sb.WriteString(fmt.Sprintf("      tokenEnv: %s\n", envName))
+		}
+		if len(srv.Headers) > 0 {
+			sb.WriteString("    headers:\n")
+			for k, v := range srv.Headers {
+				sb.WriteString(fmt.Sprintf("      %s: %s\n", k, v))
+			}
+		}
+	}
+	return sb.String()
 }
 
 // succeedRun marks an AgentRun as succeeded and stores the result.
