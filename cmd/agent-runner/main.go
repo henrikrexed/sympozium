@@ -94,6 +94,10 @@ func main() {
 	var tools []ToolDef
 	if toolsEnabled {
 		tools = defaultTools()
+		// Load MCP tools from manifest if the mcp-bridge sidecar is running
+		if mcpTools := loadMCPTools("/ipc/tools/mcp-tools.json"); len(mcpTools) > 0 {
+			tools = append(tools, mcpTools...)
+		}
 		log.Printf("tools enabled: %d tool(s) registered", len(tools))
 	}
 
