@@ -128,7 +128,14 @@ func (b *Bridge) watchAndDispatch(ctx context.Context) error {
 				continue
 			}
 
-			sem <- struct{}{} // acquire
+			// Acquire semaphore without blocking the event loop
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				wg.Wait()
+				return nil
+			}
+
 			wg.Add(1)
 			go func(path string) {
 				defer wg.Done()
@@ -147,6 +154,14 @@ func (b *Bridge) watchAndDispatch(ctx context.Context) error {
 	}
 }
 
+// extractIDFromFilename extracts the request ID from a filename like "mcp-request-<id>.json".
+func extractIDFromFilename(path string) string {
+	base := filepath.Base(path)
+	base = strings.TrimPrefix(base, "mcp-request-")
+	base = strings.TrimSuffix(base, ".json")
+	return base
+}
+
 // handleRequest processes a single MCP request file.
 func (b *Bridge) handleRequest(ctx context.Context, path string) {
 	// Small delay to ensure file write is complete
@@ -154,14 +169,16 @@ func (b *Bridge) handleRequest(ctx context.Context, path string) {
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		log.Printf("Failed to read request %s: %v", path, err)
+		log.Printf("Failed to read request %s: %v", filepath.Base(path), err)
 		return
 	}
 
 	var req MCPRequest
 	if err := json.Unmarshal(data, &req); err != nil {
-		log.Printf("Failed to parse request %s: %v", path, err)
-		b.writeErrorResult(req.ID, path, "invalid request JSON")
+		log.Printf("Failed to parse request %s: %v", filepath.Base(path), err)
+		// Use ID from filename when JSON parse fails
+		id := extractIDFromFilename(path)
+		b.writeErrorResult(id, path, "invalid request JSON")
 		return
 	}
 
@@ -230,7 +247,12 @@ func (b *Bridge) handleRequest(ctx context.Context, path string) {
 	}
 
 	// Marshal content
-	contentData, _ := json.Marshal(callResult.Content)
+	contentData, err := json.Marshal(callResult.Content)
+	if err != nil {
+		log.Printf("Failed to marshal content for request %s: %v", req.ID, err)
+		b.writeErrorResult(req.ID, path, "failed to marshal tool result content")
+		return
+	}
 	result.Content = contentData
 
 	b.writeResult(req.ID, path, &result)
@@ -262,7 +284,10 @@ func (b *Bridge) resolveByPrefix(prefixedTool string) (serverName, toolName stri
 
 // writeResult writes an MCPResult to the result file.
 func (b *Bridge) writeResult(id, reqPath string, result *MCPResult) {
-	resPath := strings.Replace(reqPath, "mcp-request-", "mcp-result-", 1)
+	// Derive result path safely using filepath operations
+	dir := filepath.Dir(reqPath)
+	base := strings.Replace(filepath.Base(reqPath), "mcp-request-", "mcp-result-", 1)
+	resPath := filepath.Join(dir, base)
 
 	data, err := json.Marshal(result)
 	if err != nil {
@@ -283,7 +308,9 @@ func (b *Bridge) writeResult(id, reqPath string, result *MCPResult) {
 	}
 
 	// Clean up request file
-	os.Remove(reqPath)
+	if err := os.Remove(reqPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Failed to clean up request file %s: %v", filepath.Base(reqPath), err)
+	}
 }
 
 // writeErrorResult writes an error MCPResult.

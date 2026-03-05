@@ -37,11 +37,18 @@ func TestLoadMCPTools(t *testing.T) {
 		},
 	}
 
-	data, _ := json.Marshal(manifest)
-	os.WriteFile(manifestPath, data, 0o644)
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("failed to marshal manifest: %v", err)
+	}
+	if err := os.WriteFile(manifestPath, data, 0o644); err != nil {
+		t.Fatalf("failed to write manifest: %v", err)
+	}
 
 	// Reset global registry
+	mcpToolRegistryMu.Lock()
 	mcpToolRegistry = map[string]mcpToolEntry{}
+	mcpToolRegistryMu.Unlock()
 
 	tools := loadMCPTools(manifestPath)
 	if len(tools) != 2 {
@@ -60,24 +67,28 @@ func TestLoadMCPTools(t *testing.T) {
 	}
 
 	// Check registry was populated
-	if _, ok := mcpToolRegistry["k8s_net_diagnose_gateway"]; !ok {
+	if _, ok := lookupMCPTool("k8s_net_diagnose_gateway"); !ok {
 		t.Error("mcpToolRegistry missing k8s_net_diagnose_gateway")
 	}
-	if _, ok := mcpToolRegistry["otel_analyze_pipeline"]; !ok {
+	if _, ok := lookupMCPTool("otel_analyze_pipeline"); !ok {
 		t.Error("mcpToolRegistry missing otel_analyze_pipeline")
 	}
 }
 
 func TestLoadMCPToolsNoFile(t *testing.T) {
 	// Reset
+	mcpToolRegistryMu.Lock()
 	mcpToolRegistry = map[string]mcpToolEntry{}
+	mcpToolRegistryMu.Unlock()
 
 	// Use a short timeout by testing with a non-existent path
 	// This would normally wait 15s but the file will never appear
 	// so we test the "no manifest" path by providing an empty manifest
 	dir := t.TempDir()
 	emptyManifest := filepath.Join(dir, "mcp-tools.json")
-	os.WriteFile(emptyManifest, []byte(`{"tools":[]}`), 0o644)
+	if err := os.WriteFile(emptyManifest, []byte(`{"tools":[]}`), 0o644); err != nil {
+		t.Fatalf("failed to write manifest: %v", err)
+	}
 
 	tools := loadMCPTools(emptyManifest)
 	if tools != nil {
@@ -86,11 +97,15 @@ func TestLoadMCPToolsNoFile(t *testing.T) {
 }
 
 func TestLoadMCPToolsInvalidJSON(t *testing.T) {
+	mcpToolRegistryMu.Lock()
 	mcpToolRegistry = map[string]mcpToolEntry{}
+	mcpToolRegistryMu.Unlock()
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mcp-tools.json")
-	os.WriteFile(path, []byte("not json"), 0o644)
+	if err := os.WriteFile(path, []byte("not json"), 0o644); err != nil {
+		t.Fatalf("failed to write manifest: %v", err)
+	}
 
 	tools := loadMCPTools(path)
 	if tools != nil {
@@ -167,108 +182,87 @@ func TestFormatMCPResult(t *testing.T) {
 
 func TestExecuteMCPToolWritesRequest(t *testing.T) {
 	dir := t.TempDir()
-	toolsDir := dir
 
-	// Override the IPC path for testing by creating files directly
+	// Override IPC path for testing
+	oldDir := mcpToolsDir
+	mcpToolsDir = dir
+	t.Cleanup(func() { mcpToolsDir = oldDir })
+
 	tool := mcpToolEntry{
 		Name:    "test_ping",
 		Server:  "test-srv",
 		Timeout: 2,
 	}
 
-	// We can't easily test the full executeMCPTool since it uses /ipc/tools,
-	// but we can test the request/result file format by simulating the flow.
+	// Write a result file before calling executeMCPTool so it returns quickly
+	// We need to know the request ID - use a goroutine to watch for the request
+	go func() {
+		// Poll for the request file to appear
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			entries, _ := os.ReadDir(dir)
+			for _, entry := range entries {
+				if filepath.Ext(entry.Name()) == ".json" && len(entry.Name()) > 12 && entry.Name()[:12] == "mcp-request-" {
+					// Read the request to get the ID
+					reqData, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+					if err != nil {
+						continue
+					}
+					var req mcpRequest
+					if err := json.Unmarshal(reqData, &req); err != nil {
+						continue
+					}
+					// Write the result
+					result := mcpResult{
+						ID:      req.ID,
+						Success: true,
+						Content: mustMarshal([]mcpContent{{Type: "text", Text: "pong"}}),
+					}
+					resData, _ := json.Marshal(result)
+					resPath := filepath.Join(dir, "mcp-result-"+req.ID+".json")
+					os.WriteFile(resPath, resData, 0o644)
+					return
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
 
-	// Simulate: write a request, then write a result, verify parsing
-	id := "test-123"
-	reqPath := filepath.Join(toolsDir, "mcp-request-"+id+".json")
-	resPath := filepath.Join(toolsDir, "mcp-result-"+id+".json")
-
-	req := mcpRequest{
-		ID:        id,
-		Server:    tool.Server,
-		Tool:      tool.Name,
-		Arguments: json.RawMessage(`{"key":"value"}`),
-		Meta:      map[string]string{"traceparent": "00-abc-def-01"},
-	}
-	reqData, _ := json.Marshal(req)
-	os.WriteFile(reqPath, reqData, 0o644)
-
-	// Verify request file is valid
-	readData, err := os.ReadFile(reqPath)
-	if err != nil {
-		t.Fatalf("failed to read request: %v", err)
-	}
-	var parsed mcpRequest
-	if err := json.Unmarshal(readData, &parsed); err != nil {
-		t.Fatalf("failed to parse request: %v", err)
-	}
-	if parsed.Tool != "test_ping" {
-		t.Errorf("parsed.Tool = %q, want %q", parsed.Tool, "test_ping")
-	}
-	if parsed.Server != "test-srv" {
-		t.Errorf("parsed.Server = %q, want %q", parsed.Server, "test-srv")
-	}
-	if parsed.Meta["traceparent"] != "00-abc-def-01" {
-		t.Errorf("parsed.Meta[traceparent] = %q", parsed.Meta["traceparent"])
-	}
-
-	// Write a result file
-	result := mcpResult{
-		ID:      id,
-		Success: true,
-		Content: mustMarshal([]mcpContent{{Type: "text", Text: "pong"}}),
-	}
-	resData, _ := json.Marshal(result)
-	os.WriteFile(resPath, resData, 0o644)
-
-	// Verify result parsing
-	var parsedResult mcpResult
-	json.Unmarshal(resData, &parsedResult)
-	output := formatMCPResult(parsedResult)
+	output := executeMCPTool(context.Background(), tool, `{"key":"value"}`)
 	if output != "pong" {
-		t.Errorf("formatMCPResult() = %q, want %q", output, "pong")
+		t.Errorf("executeMCPTool() = %q, want %q", output, "pong")
 	}
 }
 
 func TestExecuteMCPToolTimeout(t *testing.T) {
-	// Test that executeMCPTool returns a timeout error when no result appears.
-	// We override the tools dir to a temp directory and set a very short timeout.
-
-	// Save and restore the original path
 	dir := t.TempDir()
-	toolsDir := dir
+
+	// Override IPC path for testing
+	oldDir := mcpToolsDir
+	mcpToolsDir = dir
+	t.Cleanup(func() { mcpToolsDir = oldDir })
 
 	tool := mcpToolEntry{
 		Name:    "slow_tool",
 		Server:  "test",
-		Timeout: 1, // 1 second timeout -> will wait 11s total, too long for test
+		Timeout: 1, // 1 second timeout + 10s buffer = 11s, but context will cancel
 	}
 
-	// Instead of calling executeMCPTool directly (which uses hardcoded /ipc/tools),
-	// test the timeout logic inline
-	id := "timeout-test"
-	resPath := filepath.Join(toolsDir, "mcp-result-"+id+".json")
+	// Use a context with short deadline
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
 
-	// Poll with very short deadline
-	deadline := time.Now().Add(200 * time.Millisecond)
-	var result *mcpResult
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(resPath)
-		if err == nil && len(data) > 0 {
-			result = &mcpResult{}
-			json.Unmarshal(data, result)
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	output := executeMCPTool(ctx, tool, `{}`)
+	if output != "Error: context cancelled while waiting for MCP tool result" {
+		t.Errorf("expected context cancelled error, got %q", output)
 	}
+}
 
-	if result != nil {
-		t.Error("expected timeout (nil result), but got a result")
+func TestExecuteMCPToolInvalidArgs(t *testing.T) {
+	output := executeMCPTool(context.Background(), mcpToolEntry{Name: "t", Server: "s"}, "not json")
+	if output != "Error: invalid JSON arguments for MCP tool call" {
+		t.Errorf("expected invalid JSON error, got %q", output)
 	}
-
-	_ = tool // used for documentation
-	_ = context.Background()
 }
 
 func mustMarshal(v any) json.RawMessage {

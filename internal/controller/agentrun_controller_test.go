@@ -930,7 +930,7 @@ func TestBuildVolumes_MCPConfig(t *testing.T) {
 			if v.ConfigMap == nil {
 				t.Fatal("mcp-config volume should be a ConfigMap volume")
 			}
-			expected := run.Spec.InstanceRef + "-mcp-servers"
+			expected := run.Name + "-mcp-servers"
 			if v.ConfigMap.Name != expected {
 				t.Errorf("mcp-config ConfigMap name = %q, want %q", v.ConfigMap.Name, expected)
 			}
@@ -954,18 +954,21 @@ func TestBuildVolumes_NoMCPConfigWhenNoServers(t *testing.T) {
 
 func TestBuildMCPServersYAML(t *testing.T) {
 	servers := testMCPServers()
-	yaml := buildMCPServersYAML(servers)
+	y, err := buildMCPServersYAML(servers)
+	if err != nil {
+		t.Fatalf("buildMCPServersYAML failed: %v", err)
+	}
 
-	if !strings.Contains(yaml, "name: k8s-networking") {
+	if !strings.Contains(y, "name: k8s-networking") {
 		t.Error("missing k8s-networking server name")
 	}
-	if !strings.Contains(yaml, "url: http://mcp-k8s-networking:8080") {
+	if !strings.Contains(y, "url: http://mcp-k8s-networking:8080") {
 		t.Error("missing k8s-networking URL")
 	}
-	if !strings.Contains(yaml, "toolsPrefix: k8s_net") {
+	if !strings.Contains(y, "toolsPrefix: k8s_net") {
 		t.Error("missing k8s_net prefix")
 	}
-	if !strings.Contains(yaml, "tokenEnv: MCP_AUTH_OTEL_COLLECTOR") {
+	if !strings.Contains(y, "tokenEnv: MCP_AUTH_OTEL_COLLECTOR") {
 		t.Error("missing auth env var reference for otel-collector")
 	}
 }
@@ -974,8 +977,11 @@ func TestBuildMCPServersYAML_DefaultTimeout(t *testing.T) {
 	servers := []sympoziumv1alpha1.MCPServerRef{
 		{Name: "test", URL: "http://test:8080", ToolsPrefix: "t"},
 	}
-	yaml := buildMCPServersYAML(servers)
-	if !strings.Contains(yaml, "timeout: 30") {
+	y, err := buildMCPServersYAML(servers)
+	if err != nil {
+		t.Fatalf("buildMCPServersYAML failed: %v", err)
+	}
+	if !strings.Contains(y, "timeout: 30") {
 		t.Error("expected default timeout of 30")
 	}
 }
@@ -989,9 +995,32 @@ func TestBuildMCPServersYAML_WithHeaders(t *testing.T) {
 			Headers:     map[string]string{"X-Custom": "value"},
 		},
 	}
-	yaml := buildMCPServersYAML(servers)
-	if !strings.Contains(yaml, "X-Custom: value") {
+	y, err := buildMCPServersYAML(servers)
+	if err != nil {
+		t.Fatalf("buildMCPServersYAML failed: %v", err)
+	}
+	if !strings.Contains(y, "X-Custom: value") {
 		t.Error("missing custom header in YAML")
+	}
+}
+
+func TestBuildMCPServersYAML_InjectionSafe(t *testing.T) {
+	servers := []sympoziumv1alpha1.MCPServerRef{
+		{
+			Name:        "evil\n  injected: true",
+			URL:         "http://test:8080",
+			ToolsPrefix: "t",
+		},
+	}
+	y, err := buildMCPServersYAML(servers)
+	if err != nil {
+		t.Fatalf("buildMCPServersYAML failed: %v", err)
+	}
+	// Proper YAML serializer uses block scalar (|-) to safely encode
+	// the newline inside the name value, so "injected: true" stays
+	// as part of the name string, not a separate YAML key.
+	if !strings.Contains(y, "|-") {
+		t.Errorf("YAML serializer should use block scalar for multi-line value: %s", y)
 	}
 }
 

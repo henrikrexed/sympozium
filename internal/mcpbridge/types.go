@@ -64,7 +64,7 @@ type MCPToolDef struct {
 // JSONRPCRequest is a JSON-RPC 2.0 request.
 type JSONRPCRequest struct {
 	JSONRPC string `json:"jsonrpc"`
-	ID      int    `json:"id"`
+	ID      int64  `json:"id"`
 	Method  string `json:"method"`
 	Params  any    `json:"params,omitempty"`
 }
@@ -72,7 +72,7 @@ type JSONRPCRequest struct {
 // JSONRPCResponse is a JSON-RPC 2.0 response.
 type JSONRPCResponse struct {
 	JSONRPC string           `json:"jsonrpc"`
-	ID      *int             `json:"id"`
+	ID      *int64           `json:"id"`
 	Result  json.RawMessage  `json:"result,omitempty"`
 	Error   *JSONRPCError    `json:"error,omitempty"`
 }

@@ -21,7 +21,7 @@ func (b *Bridge) discoverTools(ctx context.Context) (*MCPToolManifest, error) {
 
 		tools, err := client.DiscoverTools(ctx)
 		if err != nil {
-			log.Printf("WARNING: failed to discover tools from %q (%s): %v", srv.Name, srv.URL, err)
+			log.Printf("WARNING: failed to discover tools from %q: %v", srv.Name, err)
 			continue
 		}
 

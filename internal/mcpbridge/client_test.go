@@ -314,4 +314,4 @@ func TestClientResponseSizeLimit(t *testing.T) {
 	}
 }
 
-func intPtr(i int) *int { return &i }
+func intPtr(i int64) *int64 { return &i }

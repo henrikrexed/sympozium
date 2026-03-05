@@ -219,7 +219,7 @@ func executeToolCall(ctx context.Context, name string, argsJSON string) string {
 		return scheduleTaskTool(args)
 	default:
 		// Check if this is an MCP tool from the manifest
-		if mcpTool, ok := mcpToolRegistry[name]; ok {
+		if mcpTool, ok := lookupMCPTool(name); ok {
 			return executeMCPTool(ctx, mcpTool, argsJSON)
 		}
 		return fmt.Sprintf("Unknown tool: %s", name)

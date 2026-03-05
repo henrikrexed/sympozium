@@ -15,12 +15,12 @@ const DefaultTimeout = 30
 func LoadConfig(path string) (*ServersConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("reading config file %s: %w", path, err)
+		return nil, fmt.Errorf("reading config file: %w", err)
 	}
 
 	var cfg ServersConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing config file %s: %w", path, err)
+		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 
 	// Apply defaults
@@ -38,6 +38,10 @@ func LoadConfig(path string) (*ServersConfig, error) {
 
 // ValidateConfig checks the server registry for errors.
 func ValidateConfig(cfg *ServersConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("config is nil")
+	}
+
 	if len(cfg.Servers) == 0 {
 		return nil // empty config is valid — bridge exits gracefully
 	}
@@ -56,9 +60,16 @@ func ValidateConfig(cfg *ServersConfig) error {
 			return fmt.Errorf("server[%d] %q: toolsPrefix is required", i, s.Name)
 		}
 
-		// Validate URL format
-		if _, err := url.ParseRequestURI(s.URL); err != nil {
+		// Validate URL format — must be a valid absolute HTTP(S) URL
+		u, err := url.ParseRequestURI(s.URL)
+		if err != nil {
 			return fmt.Errorf("server[%d] %q: invalid url %q: %w", i, s.Name, s.URL, err)
+		}
+		if u.Host == "" {
+			return fmt.Errorf("server[%d] %q: url %q has no host", i, s.Name, s.URL)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("server[%d] %q: url scheme must be http or https, got %q", i, s.Name, u.Scheme)
 		}
 
 		// Check unique names

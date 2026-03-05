@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os"
 	"os/signal"
@@ -29,9 +30,11 @@ func main() {
 	// Load and validate configuration
 	cfg, err := mcpbridge.LoadConfig(configPath)
 	if err != nil {
-		log.Printf("Failed to load config: %v", err)
-		log.Printf("No MCP servers configured, exiting gracefully")
-		os.Exit(0)
+		if errors.Is(err, os.ErrNotExist) {
+			log.Printf("No MCP config file found at %s, exiting gracefully", configPath)
+			os.Exit(0)
+		}
+		log.Fatalf("Failed to load MCP config: %v", err)
 	}
 
 	if err := mcpbridge.ValidateConfig(cfg); err != nil {

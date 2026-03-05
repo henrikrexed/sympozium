@@ -8,7 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // mcpToolManifest mirrors mcpbridge.MCPToolManifest for JSON deserialization.
@@ -50,8 +53,28 @@ type mcpContent struct {
 }
 
 // mcpToolRegistry maps prefixed tool names to their definitions.
-// Populated by loadMCPTools and used by executeToolCall dispatch.
-var mcpToolRegistry = map[string]mcpToolEntry{}
+// Populated by loadMCPTools at startup before any tool calls,
+// then read-only during dispatch. Protected by mcpToolRegistryMu
+// for safety.
+var (
+	mcpToolRegistry   = map[string]mcpToolEntry{}
+	mcpToolRegistryMu sync.RWMutex
+)
+
+// mcpToolsDir is the IPC directory for MCP tool request/result files.
+// Configurable for testing.
+var mcpToolsDir = "/ipc/tools"
+
+// mcpRequestCounter provides unique IDs for MCP requests.
+var mcpRequestCounter atomic.Int64
+
+// lookupMCPTool returns the tool entry and true if found.
+func lookupMCPTool(name string) (mcpToolEntry, bool) {
+	mcpToolRegistryMu.RLock()
+	defer mcpToolRegistryMu.RUnlock()
+	t, ok := mcpToolRegistry[name]
+	return t, ok
+}
 
 // loadMCPTools reads the MCP tool manifest and returns ToolDef entries
 // for the LLM tool list. It also populates mcpToolRegistry for dispatch.
@@ -85,6 +108,7 @@ func loadMCPTools(manifestPath string) []ToolDef {
 	}
 
 	var tools []ToolDef
+	mcpToolRegistryMu.Lock()
 	for _, t := range manifest.Tools {
 		mcpToolRegistry[t.Name] = t
 
@@ -105,6 +129,7 @@ func loadMCPTools(manifestPath string) []ToolDef {
 			Parameters:  params,
 		})
 	}
+	mcpToolRegistryMu.Unlock()
 
 	log.Printf("Loaded %d MCP tool(s) from manifest", len(tools))
 	return tools
@@ -113,7 +138,12 @@ func loadMCPTools(manifestPath string) []ToolDef {
 // executeMCPTool dispatches an MCP tool call via file-based IPC to the
 // mcp-bridge sidecar. It mirrors the executeCommand pattern exactly.
 func executeMCPTool(ctx context.Context, tool mcpToolEntry, argsJSON string) string {
-	id := fmt.Sprintf("%d", time.Now().UnixNano())
+	// Validate argsJSON is valid JSON
+	if !json.Valid([]byte(argsJSON)) {
+		return "Error: invalid JSON arguments for MCP tool call"
+	}
+
+	id := fmt.Sprintf("%d", mcpRequestCounter.Add(1))
 
 	req := mcpRequest{
 		ID:        id,
@@ -123,7 +153,7 @@ func executeMCPTool(ctx context.Context, tool mcpToolEntry, argsJSON string) str
 		Meta:      traceMetadata(ctx),
 	}
 
-	toolsDir := "/ipc/tools"
+	toolsDir := mcpToolsDir
 	reqPath := filepath.Join(toolsDir, fmt.Sprintf("mcp-request-%s.json", id))
 	resPath := filepath.Join(toolsDir, fmt.Sprintf("mcp-result-%s.json", id))
 
@@ -132,7 +162,9 @@ func executeMCPTool(ctx context.Context, tool mcpToolEntry, argsJSON string) str
 		return fmt.Sprintf("Error marshalling MCP request: %v", err)
 	}
 
-	_ = os.MkdirAll(toolsDir, 0o755)
+	if err := os.MkdirAll(toolsDir, 0o755); err != nil {
+		return fmt.Sprintf("Error creating MCP tools directory: %v", err)
+	}
 	if err := os.WriteFile(reqPath, data, 0o644); err != nil {
 		return fmt.Sprintf("Error writing MCP request: %v", err)
 	}
@@ -147,6 +179,11 @@ func executeMCPTool(ctx context.Context, tool mcpToolEntry, argsJSON string) str
 	deadline := time.Now().Add(time.Duration(timeoutSec+10) * time.Second)
 
 	for time.Now().Before(deadline) {
+		// Check context cancellation
+		if ctx.Err() != nil {
+			return "Error: context cancelled while waiting for MCP tool result"
+		}
+
 		resData, err := os.ReadFile(resPath)
 		if err == nil {
 			if len(resData) == 0 {
@@ -214,7 +251,12 @@ func formatMCPResult(r mcpResult) string {
 		output = "(no output)"
 	}
 	if len(output) > 50_000 {
-		output = output[:50_000] + "\n... (output truncated)"
+		// Truncate at a valid UTF-8 boundary
+		truncated := output[:50_000]
+		for !utf8.ValidString(truncated) && len(truncated) > 0 {
+			truncated = truncated[:len(truncated)-1]
+		}
+		output = truncated + "\n... (output truncated)"
 	}
 	return output
 }

@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,8 +21,9 @@ const MaxResponseSize = 1 << 20
 type Client struct {
 	serverConfig ServerConfig
 	httpClient   *http.Client
+	mu           sync.Mutex // protects sessionID
 	sessionID    string
-	nextID       int
+	nextID       atomic.Int64
 }
 
 // NewClient creates an MCP client for the given server configuration.
@@ -93,10 +97,10 @@ func (c *Client) callTool(ctx context.Context, name string, arguments json.RawMe
 
 // call sends a JSON-RPC 2.0 request and unmarshals the result.
 func (c *Client) call(ctx context.Context, method string, params any, result any) error {
-	c.nextID++
+	id := c.nextID.Add(1)
 	req := JSONRPCRequest{
 		JSONRPC: "2.0",
-		ID:      c.nextID,
+		ID:      id,
 		Method:  method,
 		Params:  params,
 	}
@@ -115,8 +119,11 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 	httpReq.Header.Set("Accept", "application/json")
 
 	// Set session ID if we have one from a previous response
-	if c.sessionID != "" {
-		httpReq.Header.Set("Mcp-Session-Id", c.sessionID)
+	c.mu.Lock()
+	sid := c.sessionID
+	c.mu.Unlock()
+	if sid != "" {
+		httpReq.Header.Set("Mcp-Session-Id", sid)
 	}
 
 	// Apply auth
@@ -134,8 +141,10 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 	defer resp.Body.Close()
 
 	// Capture session ID from response
-	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
-		c.sessionID = sid
+	if newSID := resp.Header.Get("Mcp-Session-Id"); newSID != "" {
+		c.mu.Lock()
+		c.sessionID = newSID
+		c.mu.Unlock()
 	}
 
 	// Read response with size limit
@@ -149,7 +158,12 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, c.serverConfig.URL, string(respBody))
+		// Truncate error body to avoid leaking large/sensitive responses into logs
+		errBody := string(respBody)
+		if len(errBody) > 512 {
+			errBody = errBody[:512] + "...(truncated)"
+		}
+		return fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, c.serverConfig.URL, errBody)
 	}
 
 	var rpcResp JSONRPCResponse
@@ -188,8 +202,11 @@ func (c *Client) notify(ctx context.Context, method string) error {
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	if c.sessionID != "" {
-		httpReq.Header.Set("Mcp-Session-Id", c.sessionID)
+	c.mu.Lock()
+	sid := c.sessionID
+	c.mu.Unlock()
+	if sid != "" {
+		httpReq.Header.Set("Mcp-Session-Id", sid)
 	}
 	c.applyAuth(httpReq)
 
@@ -197,6 +214,8 @@ func (c *Client) notify(ctx context.Context, method string) error {
 	if err != nil {
 		return err
 	}
+	// Drain body to enable connection reuse
+	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	return nil
 }
@@ -209,6 +228,7 @@ func (c *Client) applyAuth(req *http.Request) {
 
 	token := os.Getenv(c.serverConfig.Auth.SecretKey)
 	if token == "" {
+		log.Printf("WARNING: auth env var %q is empty for server %q", c.serverConfig.Auth.SecretKey, c.serverConfig.Name)
 		return
 	}
 

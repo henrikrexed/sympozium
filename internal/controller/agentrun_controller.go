@@ -32,6 +32,7 @@ import (
 
 	sympoziumv1alpha1 "github.com/alexsjones/sympozium/api/v1alpha1"
 	"github.com/alexsjones/sympozium/internal/orchestrator"
+	"gopkg.in/yaml.v3"
 )
 
 var controllerTracer = otel.Tracer("sympozium.ai/controller")
@@ -262,7 +263,7 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	// Create MCP ConfigMap if MCP servers are configured.
 	if len(mcpServers) > 0 {
 		if err := r.ensureMCPConfigMap(ctx, agentRun, mcpServers); err != nil {
-			log.Error(err, "Failed to create MCP ConfigMap")
+			return ctrl.Result{}, fmt.Errorf("creating MCP ConfigMap: %w", err)
 		}
 	}
 
@@ -1267,7 +1268,7 @@ func (r *AgentRunReconciler) buildVolumes(agentRun *sympoziumv1alpha1.AgentRun, 
 
 	// Add MCP config volume if MCP servers are configured.
 	if len(mcpServers) > 0 {
-		cmName := fmt.Sprintf("%s-mcp-servers", agentRun.Spec.InstanceRef)
+		cmName := fmt.Sprintf("%s-mcp-servers", agentRun.Name)
 		volumes = append(volumes, corev1.Volume{
 			Name: "mcp-config",
 			VolumeSource: corev1.VolumeSource{
@@ -1397,16 +1398,21 @@ func (r *AgentRunReconciler) createInputConfigMap(ctx context.Context, agentRun 
 // ensureMCPConfigMap creates or updates the ConfigMap with MCP server
 // configuration for the mcp-bridge sidecar.
 func (r *AgentRunReconciler) ensureMCPConfigMap(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun, mcpServers []sympoziumv1alpha1.MCPServerRef) error {
-	cmName := fmt.Sprintf("%s-mcp-servers", agentRun.Spec.InstanceRef)
+	// Scope ConfigMap to the AgentRun so each run gets its own config
+	// and cleanup is handled by garbage collection.
+	cmName := fmt.Sprintf("%s-mcp-servers", agentRun.Name)
 
-	// Build the mcp-servers.yaml content.
-	yamlContent := buildMCPServersYAML(mcpServers)
+	yamlContent, err := buildMCPServersYAML(mcpServers)
+	if err != nil {
+		return fmt.Errorf("building MCP servers YAML: %w", err)
+	}
 
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cmName,
 			Namespace: agentRun.Namespace,
 			Labels: map[string]string{
+				"sympozium.ai/agent-run": agentRun.Name,
 				"sympozium.ai/instance":  agentRun.Spec.InstanceRef,
 				"sympozium.ai/component": "mcp-config",
 			},
@@ -1429,34 +1435,62 @@ func (r *AgentRunReconciler) ensureMCPConfigMap(ctx context.Context, agentRun *s
 	return nil
 }
 
-// buildMCPServersYAML generates the YAML config for the mcp-bridge sidecar.
-func buildMCPServersYAML(mcpServers []sympoziumv1alpha1.MCPServerRef) string {
-	var sb strings.Builder
-	sb.WriteString("servers:\n")
+// mcpServerYAML is the YAML-safe representation of an MCP server config.
+type mcpServerYAML struct {
+	Name        string            `yaml:"name"`
+	URL         string            `yaml:"url"`
+	ToolsPrefix string            `yaml:"toolsPrefix"`
+	Timeout     int               `yaml:"timeout"`
+	Auth        *mcpAuthYAML      `yaml:"auth,omitempty"`
+	Headers     map[string]string `yaml:"headers,omitempty"`
+}
+
+type mcpAuthYAML struct {
+	Type     string `yaml:"type"`
+	TokenEnv string `yaml:"tokenEnv"`
+}
+
+type mcpServersConfigYAML struct {
+	Servers []mcpServerYAML `yaml:"servers"`
+}
+
+// buildMCPServersYAML generates the YAML config for the mcp-bridge sidecar
+// using a proper YAML serializer to avoid injection attacks.
+func buildMCPServersYAML(mcpServers []sympoziumv1alpha1.MCPServerRef) (string, error) {
+	cfg := mcpServersConfigYAML{
+		Servers: make([]mcpServerYAML, 0, len(mcpServers)),
+	}
+
 	for _, srv := range mcpServers {
-		sb.WriteString(fmt.Sprintf("  - name: %s\n", srv.Name))
-		sb.WriteString(fmt.Sprintf("    url: %s\n", srv.URL))
-		sb.WriteString(fmt.Sprintf("    toolsPrefix: %s\n", srv.ToolsPrefix))
 		timeout := srv.Timeout
 		if timeout <= 0 {
 			timeout = 30
 		}
-		sb.WriteString(fmt.Sprintf("    timeout: %d\n", timeout))
-		if srv.AuthSecret != "" {
-			// Reference the env var that will be injected by the container spec.
-			envName := fmt.Sprintf("MCP_AUTH_%s", strings.ToUpper(strings.ReplaceAll(srv.Name, "-", "_")))
-			sb.WriteString("    auth:\n")
-			sb.WriteString(fmt.Sprintf("      type: bearer\n"))
-			sb.WriteString(fmt.Sprintf("      tokenEnv: %s\n", envName))
+
+		entry := mcpServerYAML{
+			Name:        srv.Name,
+			URL:         srv.URL,
+			ToolsPrefix: srv.ToolsPrefix,
+			Timeout:     timeout,
+			Headers:     srv.Headers,
 		}
-		if len(srv.Headers) > 0 {
-			sb.WriteString("    headers:\n")
-			for k, v := range srv.Headers {
-				sb.WriteString(fmt.Sprintf("      %s: %s\n", k, v))
+
+		if srv.AuthSecret != "" {
+			envName := fmt.Sprintf("MCP_AUTH_%s", strings.ToUpper(strings.ReplaceAll(srv.Name, "-", "_")))
+			entry.Auth = &mcpAuthYAML{
+				Type:     "bearer",
+				TokenEnv: envName,
 			}
 		}
+
+		cfg.Servers = append(cfg.Servers, entry)
 	}
-	return sb.String()
+
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("marshalling MCP servers config: %w", err)
+	}
+	return string(data), nil
 }
 
 // succeedRun marks an AgentRun as succeeded and stores the result.
