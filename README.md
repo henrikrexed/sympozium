@@ -219,12 +219,17 @@ graph TB
             direction LR
             A1["Agent Container<br/><small>LLM provider agnostic</small>"]
             IPC["IPC Bridge<br/><small>fsnotify → NATS</small>"]
+            MCP["MCP Bridge<br/><small>optional sidecar<br/>JSON-RPC 2.0</small>"]
             SB["Sandbox<br/><small>optional sidecar</small>"]
             SKS["Skill Sidecars<br/><small>kubectl, helm, etc.<br/>auto-RBAC</small>"]
             A1 -. "/ipc volume" .- IPC
+            A1 -. "/ipc/tools" .- MCP
             A1 -. optional .- SB
             A1 -. "/workspace" .- SKS
         end
+
+        MCPS(["Remote MCP Servers<br/><small>Streamable HTTP</small>"])
+        MCP -- "JSON-RPC 2.0" --> MCPS
 
         subgraph SEC["Skill RBAC  ·  ephemeral, least-privilege"]
             SR["Role + RoleBinding<br/><small>namespace-scoped<br/>ownerRef → AgentRun</small>"]
@@ -272,8 +277,8 @@ graph TB
 ### How It Works
 
 1. **A message arrives** via a channel pod (Telegram, Slack, etc.) and is published to the NATS event bus.
-2. **The controller creates an AgentRun CR**, which reconciles into an ephemeral K8s Job — an agent container + IPC bridge sidecar + optional sandbox + skill sidecars (with auto-provisioned RBAC).
-3. **The agent container** calls the configured LLM provider (OpenAI, Anthropic, Azure, Ollama, or any OpenAI-compatible endpoint), with skills mounted as files, persistent memory injected from a ConfigMap, and tool sidecars providing runtime capabilities like `kubectl`.
+2. **The controller creates an AgentRun CR**, which reconciles into an ephemeral K8s Job — an agent container + IPC bridge sidecar + optional sandbox + skill sidecars (with auto-provisioned RBAC) + optional MCP bridge sidecar (for remote MCP tool servers).
+3. **The agent container** calls the configured LLM provider (OpenAI, Anthropic, Azure, Ollama, or any OpenAI-compatible endpoint), with skills mounted as files, persistent memory injected from a ConfigMap, tool sidecars providing runtime capabilities like `kubectl`, and MCP tools from remote servers available via the MCP bridge.
 4. **Results flow back** through the IPC bridge → NATS → channel pod → user. The controller extracts structured results and memory updates from pod logs.
 5. **Everything is a Kubernetes resource** — instances, runs, policies, skills, and schedules are all CRDs. Lifecycle is managed by controllers. Access is gated by admission webhooks. Network isolation is enforced by NetworkPolicy. The TUI and web dashboard give you full visibility into the entire system.
 
@@ -294,6 +299,44 @@ Every agent pod has these tools available out of the box (no skill sidecar requi
 | `schedule_task` | IPC (bridge) | Create, update, suspend, resume, or delete recurring `SympoziumSchedule` tasks. Routes via IPC bridge → NATS → schedule router. |
 
 > **Native** tools run directly in the agent container. **IPC** tools communicate with sidecars or the IPC bridge via the shared `/ipc` volume. See the **[Tool Authoring Guide](docs/writing-tools.md)** for how to add your own.
+
+### MCP Bridge (Remote Tool Servers)
+
+Sympozium supports the **Model Context Protocol (MCP)** for connecting agents to remote tool servers. When a `SympoziumInstance` has `mcpServers` configured, the controller automatically injects an **mcp-bridge sidecar** into agent pods. The bridge:
+
+- Connects to remote MCP servers via **JSON-RPC 2.0 Streamable HTTP**
+- Discovers tools at startup and writes a manifest to `/ipc/tools/mcp-tools.json`
+- Watches for tool call requests via **fsnotify** on the shared IPC volume
+- Forwards calls to the correct MCP server, with **prefix-based routing** (e.g., `k8s_net_diagnose_gateway` routes to the server with prefix `k8s_net`)
+- Propagates **OpenTelemetry trace context** through `_meta.traceparent`
+
+**Configure MCP servers on your instance:**
+
+```yaml
+apiVersion: sympozium.ai/v1alpha1
+kind: SympoziumInstance
+metadata:
+  name: my-agent
+spec:
+  agents:
+    model: gpt-4o
+    provider: openai
+  mcpServers:
+    - name: k8s-networking
+      url: https://mcp.example.com/k8s-net
+      toolsPrefix: k8s_net
+      timeout: 30
+      authSecret: mcp-k8s-net-token    # Secret containing the auth token
+      authKey: token                     # key within the Secret (default: "token")
+    - name: observability
+      url: https://mcp.example.com/otel
+      toolsPrefix: otel
+      timeout: 60
+      headers:
+        X-Custom-Header: my-value
+```
+
+MCP tools appear alongside built-in tools with their prefixed names. The agent calls them like any other tool — the bridge handles routing, authentication, and result marshalling transparently.
 
 ### Built-in Skills (SkillPacks)
 
@@ -712,6 +755,7 @@ sympozium/
 │   ├── controller/         # Controller manager (reconciles all CRDs)
 │   ├── apiserver/          # HTTP + WebSocket API server (+ embedded web UI)
 │   ├── ipc-bridge/         # IPC bridge sidecar (fsnotify → NATS)
+│   ├── mcp-bridge/         # MCP bridge sidecar (file IPC → remote MCP servers)
 │   ├── webhook/            # Admission webhook (policy enforcement)
 │   └── sympozium/            # CLI + interactive TUI
 ├── web/                    # Web dashboard (React + TypeScript + Vite)
@@ -721,6 +765,7 @@ sympozium/
 │   ├── apiserver/          # API server handlers
 │   ├── eventbus/           # NATS JetStream event bus
 │   ├── ipc/                # IPC bridge (fsnotify + NATS)
+│   ├── mcpbridge/          # MCP bridge (JSON-RPC 2.0 MCP client + fsnotify dispatcher)
 │   ├── webhook/            # Policy enforcement webhooks
 │   ├── session/            # Session persistence (PostgreSQL)
 │   └── channel/            # Channel base types
@@ -758,6 +803,7 @@ sympozium/
 | **Skills-as-ConfigMap** | ConfigMap volume | SkillPacks generate ConfigMaps mounted into agent pods — portable, versionable, namespace-scoped |
 | **Skill sidecars with auto-RBAC** | Role / ClusterRole | SkillPacks can declare sidecar containers with RBAC rules — the controller injects the container and provisions ephemeral, least-privilege RBAC per run |
 | **PersonaPacks** | Operator Bundle | Pre-configured agent bundles — the controller stamps out SympoziumInstances, Schedules, and memory ConfigMaps. Activating a pack is a single TUI action |
+| **MCP bridge sidecar** | Sidecar pattern | File-based IPC translates to JSON-RPC 2.0 Streamable HTTP — agents get remote MCP tools without network access, the bridge handles auth and routing |
 
 ## Configuration
 
@@ -767,6 +813,8 @@ sympozium/
 | `DATABASE_URL` | API Server | PostgreSQL connection string |
 | `INSTANCE_NAME` | Channels | Owning SympoziumInstance name |
 | `MEMORY_ENABLED` | Agent Runner | Whether persistent memory is active |
+| `MCP_CONFIG_PATH` | MCP Bridge | Path to MCP server registry YAML (default: `/config/mcp-servers.yaml`) |
+| `MCP_IPC_PATH` | MCP Bridge | IPC directory for request/result files (default: `/ipc/tools`) |
 | `TELEGRAM_BOT_TOKEN` | Telegram | Bot API token |
 | `SLACK_BOT_TOKEN` | Slack | Bot OAuth token |
 | `DISCORD_BOT_TOKEN` | Discord | Bot token |
