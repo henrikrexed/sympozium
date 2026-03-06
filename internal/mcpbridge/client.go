@@ -195,7 +195,7 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 	ct := resp.Header.Get("Content-Type")
 	if strings.Contains(ct, "text/event-stream") || (len(respBody) > 0 && respBody[0] != '{' && respBody[0] != '[') {
 		// Parse SSE: look for "data: {...}" lines
-		for _, line := range strings.Split(string(respBody), "\n")
+		for _, line := range strings.Split(string(respBody), "\n") {
 			line = strings.TrimSpace(line)
 			if strings.HasPrefix(line, "data: ") {
 				data := strings.TrimPrefix(line, "data: ")
