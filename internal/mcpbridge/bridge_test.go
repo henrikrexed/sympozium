@@ -349,3 +349,47 @@ func TestBridgeEndToEnd(t *testing.T) {
 	cancel()
 	<-errCh
 }
+
+func TestDiscoverAndWriteManifest(t *testing.T) {
+	tools := []MCPTool{
+		{Name: "get_pods", Description: "Get pods", InputSchema: map[string]any{"type": "object"}},
+		{Name: "get_nodes", Description: "Get nodes", InputSchema: map[string]any{"type": "object"}},
+	}
+
+	srv := mockMCPServer(t, tools, nil)
+	defer srv.Close()
+
+	cfg := &ServersConfig{
+		Servers: []ServerConfig{
+			{Name: "k8s", URL: srv.URL, ToolsPrefix: "k8s", Timeout: 10, Transport: "streamable-http"},
+		},
+	}
+
+	ipcDir := t.TempDir()
+	manifestPath := filepath.Join(ipcDir, "mcp-tools.json")
+
+	bridge := NewBridge(cfg, ipcDir, manifestPath, "test-run")
+	err := bridge.DiscoverAndWriteManifest(context.Background())
+	if err != nil {
+		t.Fatalf("DiscoverAndWriteManifest failed: %v", err)
+	}
+
+	// Verify manifest file was written
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("Failed to read manifest: %v", err)
+	}
+
+	var manifest MCPToolManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("Failed to parse manifest: %v", err)
+	}
+
+	if len(manifest.Tools) != 2 {
+		t.Fatalf("expected 2 tools, got %d", len(manifest.Tools))
+	}
+
+	if manifest.Tools[0].Name != "k8s_get_pods" {
+		t.Errorf("tool[0].Name = %q, want %q", manifest.Tools[0].Name, "k8s_get_pods")
+	}
+}

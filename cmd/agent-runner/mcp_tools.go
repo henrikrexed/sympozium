@@ -82,7 +82,7 @@ func lookupMCPTool(name string) (mcpToolEntry, bool) {
 func loadMCPTools(manifestPath string) []ToolDef {
 	// Wait for the manifest file to appear (bridge may still be starting)
 	var data []byte
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		var err error
 		data, err = os.ReadFile(manifestPath)

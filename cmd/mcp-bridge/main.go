@@ -68,6 +68,16 @@ func main() {
 
 	bridge := mcpbridge.NewBridge(cfg, ipcPath, manifestPath, agentRunID)
 
+	discoverOnly := os.Getenv("MCP_DISCOVER_ONLY") == "true"
+	if discoverOnly {
+		log.Printf("Running in discover-only mode (init container)")
+		if err := bridge.DiscoverAndWriteManifest(ctx); err != nil {
+			log.Fatalf("Discovery failed: %v", err)
+		}
+		log.Printf("Discovery complete, exiting")
+		return
+	}
+
 	if err := bridge.Run(ctx); err != nil {
 		log.Fatalf("MCP bridge failed: %v", err)
 	}

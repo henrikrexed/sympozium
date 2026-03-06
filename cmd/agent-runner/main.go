@@ -97,6 +97,18 @@ func main() {
 		// Load MCP tools from manifest if the mcp-bridge sidecar is running
 		if mcpTools := loadMCPTools("/ipc/tools/mcp-tools.json"); len(mcpTools) > 0 {
 			tools = append(tools, mcpTools...)
+			// Inject MCP tool awareness into system prompt
+			var mcpToolNames []string
+			for _, t := range mcpTools {
+				mcpToolNames = append(mcpToolNames, t.Name)
+			}
+			systemPrompt += fmt.Sprintf(
+				"\n\n## Specialized MCP Tools\n\n"+
+					"You have access to %d specialized MCP tools: %s. "+
+					"These tools provide deep diagnostic and management capabilities beyond raw kubectl commands. "+
+					"ALWAYS prefer an MCP tool over execute_command when a relevant MCP tool exists for the task. "+
+					"Only fall back to execute_command for tasks that no MCP tool covers.",
+				len(mcpTools), strings.Join(mcpToolNames, ", "))
 		}
 		log.Printf("tools enabled: %d tool(s) registered", len(tools))
 	}

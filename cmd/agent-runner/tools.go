@@ -42,7 +42,7 @@ func defaultTools() []ToolDef {
 			Description: "Execute a shell command in the Kubernetes skill sidecar container. " +
 				"Use this to run kubectl, bash scripts, curl, jq, and other CLI tools. " +
 				"Commands execute in /workspace by default. " +
-				"Always prefer this tool when the user asks you to inspect or manage Kubernetes resources.",
+				"If specialized MCP tools are available for the task, prefer those instead.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{

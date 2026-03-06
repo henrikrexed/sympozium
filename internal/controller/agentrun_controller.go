@@ -685,7 +685,7 @@ func (r *AgentRunReconciler) buildJob(
 	backoffLimit := int32(0)
 
 	// Build containers
-	containers := r.buildContainers(agentRun, memoryEnabled, observability, sidecars, mcpServers)
+	containers, initContainers := r.buildContainers(agentRun, memoryEnabled, observability, sidecars, mcpServers)
 	volumes := r.buildVolumes(agentRun, memoryEnabled, sidecars, mcpServers)
 	hostNetwork, hostPID := derivePodHostAccess(sidecars)
 	dnsPolicy := corev1.DNSClusterFirst
@@ -723,8 +723,9 @@ func (r *AgentRunReconciler) buildJob(
 						FSGroup:        &fsGroup,
 						SeccompProfile: seccompProfileForPod(agentRun),
 					},
-					Containers: containers,
-					Volumes:    volumes,
+					InitContainers: initContainers,
+					Containers:     containers,
+					Volumes:        volumes,
 				},
 			},
 		},
@@ -738,9 +739,10 @@ func (r *AgentRunReconciler) buildContainers(
 	observability *sympoziumv1alpha1.ObservabilitySpec,
 	sidecars []resolvedSidecar,
 	mcpServers []sympoziumv1alpha1.MCPServerRef,
-) []corev1.Container {
+) ([]corev1.Container, []corev1.Container) {
 	readOnly := true
 	noPrivEsc := false
+	var initContainers []corev1.Container
 
 	agentEnv := []corev1.EnvVar{
 		{Name: "AGENT_RUN_ID", Value: agentRun.Name},
@@ -947,6 +949,35 @@ func (r *AgentRunReconciler) buildContainers(
 			})
 		}
 
+		// Init container for MCP tool discovery (runs before agent starts)
+		initContainers = append(initContainers, corev1.Container{
+			Name:            "mcp-discover",
+			Image:           r.imageRef("mcp-bridge"),
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			SecurityContext: &corev1.SecurityContext{
+				ReadOnlyRootFilesystem:   &readOnly,
+				AllowPrivilegeEscalation: &noPrivEsc,
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+			},
+			Env: append(append([]corev1.EnvVar{}, mcpEnv...), corev1.EnvVar{Name: "MCP_DISCOVER_ONLY", Value: "true"}),
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "ipc", MountPath: "/ipc"},
+				{Name: "mcp-config", MountPath: "/config", ReadOnly: true},
+			},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("128Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("200m"),
+					corev1.ResourceMemory: resource.MustParse("256Mi"),
+				},
+			},
+		})
+
 		containers = append(containers, corev1.Container{
 			Name:            "mcp-bridge",
 			Image:           r.imageRef("mcp-bridge"),
@@ -1119,7 +1150,7 @@ func (r *AgentRunReconciler) buildContainers(
 		containers = append(containers, container)
 	}
 
-	return containers
+	return containers, initContainers
 }
 
 func buildObservabilityEnv(agentRun *sympoziumv1alpha1.AgentRun, obs *sympoziumv1alpha1.ObservabilitySpec) []corev1.EnvVar {

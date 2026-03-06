@@ -378,3 +378,30 @@ func (b *Bridge) writeErrorResult(id, reqPath, errMsg string) {
 	}
 	b.writeResult(id, reqPath, result)
 }
+
+// DiscoverAndWriteManifest runs only the discovery phase: connect to MCP servers,
+// list tools, write the manifest, then return. Used by the init container.
+func (b *Bridge) DiscoverAndWriteManifest(ctx context.Context) error {
+	ctx, span := bridgeTracer.Start(ctx, "mcp-bridge.discover",
+		trace.WithAttributes(attribute.String("agent_run_id", b.agentRunID)),
+	)
+	defer span.End()
+
+	manifest, err := b.discoverTools(ctx)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "tool discovery failed")
+		return err
+	}
+
+	span.SetAttributes(attribute.Int("mcp.tools_discovered", len(manifest.Tools)))
+
+	if err := WriteManifest(b.manifestPath, manifest); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "manifest write failed")
+		return err
+	}
+
+	log.Printf("Wrote tool manifest with %d tools to %s", len(manifest.Tools), b.manifestPath)
+	return nil
+}
