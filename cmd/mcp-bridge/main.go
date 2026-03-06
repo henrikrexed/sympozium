@@ -6,9 +6,12 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -42,6 +45,21 @@ func main() {
 		defer tel.Shutdown(context.Background())
 	}
 
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// Check for stdio-adapter mode
+	stdioAdapter := flag.Bool("stdio-adapter", false, "Run as stdio-to-HTTP adapter")
+	flag.Parse()
+	if !*stdioAdapter && os.Getenv("MCP_STDIO_ADAPTER") == "true" {
+		*stdioAdapter = true
+	}
+
+	if *stdioAdapter {
+		runStdioAdapter(ctx, cancel)
+		return
+	}
+
 	// Load and validate configuration
 	cfg, err := mcpbridge.LoadConfig(configPath)
 	if err != nil {
@@ -62,9 +80,6 @@ func main() {
 	}
 
 	log.Printf("Loaded %d MCP server(s) from config", len(cfg.Servers))
-
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	bridge := mcpbridge.NewBridge(cfg, ipcPath, manifestPath, agentRunID)
 
@@ -90,4 +105,48 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func runStdioAdapter(ctx context.Context, cancel context.CancelFunc) {
+	defer cancel()
+
+	stdioCmd := os.Getenv("STDIO_CMD")
+	if stdioCmd == "" {
+		log.Fatal("STDIO_CMD is required in stdio-adapter mode")
+	}
+
+	var stdioArgs []string
+	if args := os.Getenv("STDIO_ARGS"); args != "" {
+		stdioArgs = strings.Split(args, ",")
+	}
+
+	port := 8080
+	if p := os.Getenv("STDIO_PORT"); p != "" {
+		var err error
+		port, err = strconv.Atoi(p)
+		if err != nil {
+			log.Fatalf("invalid STDIO_PORT: %v", err)
+		}
+	}
+
+	serverName := envOrDefault("STDIO_SERVER_NAME", "stdio-mcp-server")
+
+	// Collect STDIO_ENV_* vars for child process
+	var childEnv []string
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "STDIO_ENV_") {
+			// Strip STDIO_ENV_ prefix
+			stripped := strings.TrimPrefix(e, "STDIO_ENV_")
+			childEnv = append(childEnv, stripped)
+		}
+	}
+
+	manager := mcpbridge.NewStdioManager(stdioCmd, stdioArgs, childEnv)
+	adapter := mcpbridge.NewStdioAdapter(manager, serverName, port)
+
+	log.Printf("Starting stdio adapter (cmd=%s args=%v port=%d server=%s)", stdioCmd, stdioArgs, port, serverName)
+
+	if err := adapter.Run(ctx); err != nil {
+		log.Fatalf("stdio adapter failed: %v", err)
+	}
 }
