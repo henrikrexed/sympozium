@@ -2,6 +2,7 @@ package mcpbridge
 
 import (
 	"bytes"
+	"strings"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -188,8 +189,33 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 		return err
 	}
 
+	// Handle SSE responses (Content-Type: text/event-stream)
+	// MCP servers may respond with SSE even when Accept includes application/json
+	actualBody := respBody
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "text/event-stream") || (len(respBody) > 0 && respBody[0] != '{' && respBody[0] != '[') {
+		// Parse SSE: look for "data: {...}" lines
+		for _, line := range strings.Split(string(respBody), "\n")
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "data: ") {
+				data := strings.TrimPrefix(line, "data: ")
+				if len(data) > 0 && data[0] == '{' {
+					actualBody = []byte(data)
+					break
+				}
+			}
+		}
+		if bytes.Equal(actualBody, respBody) && (len(actualBody) == 0 || actualBody[0] != '{') {
+			preview := string(respBody)
+			if len(preview) > 200 {
+				preview = preview[:200]
+			}
+			return fmt.Errorf("SSE response contained no JSON-RPC data: %s", preview)
+		}
+	}
+
 	var rpcResp JSONRPCResponse
-	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
+	if err := json.Unmarshal(actualBody, &rpcResp); err != nil {
 		return fmt.Errorf("parsing JSON-RPC response: %w", err)
 	}
 
