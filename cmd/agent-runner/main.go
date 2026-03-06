@@ -97,18 +97,32 @@ func main() {
 		// Load MCP tools from manifest if the mcp-bridge sidecar is running
 		if mcpTools := loadMCPTools("/ipc/tools/mcp-tools.json"); len(mcpTools) > 0 {
 			tools = append(tools, mcpTools...)
-			// Inject MCP tool awareness into system prompt
-			var mcpToolNames []string
+
+			// Group tools by server prefix
+			serverTools := make(map[string][]string)
 			for _, t := range mcpTools {
-				mcpToolNames = append(mcpToolNames, t.Name)
+				parts := strings.SplitN(t.Name, "_", 2)
+				prefix := parts[0]
+				serverTools[prefix] = append(serverTools[prefix], t.Name)
 			}
-			systemPrompt += fmt.Sprintf(
-				"\n\n## Specialized MCP Tools\n\n"+
-					"You have access to %d specialized MCP tools: %s. "+
-					"These tools provide deep diagnostic and management capabilities beyond raw kubectl commands. "+
-					"ALWAYS prefer an MCP tool over execute_command when a relevant MCP tool exists for the task. "+
-					"Only fall back to execute_command for tasks that no MCP tool covers.",
-				len(mcpTools), strings.Join(mcpToolNames, ", "))
+
+			var sb strings.Builder
+			sb.WriteString("\n\n## Specialized MCP Tools\n\n")
+			sb.WriteString(fmt.Sprintf("You have access to %d specialized MCP tools. ", len(mcpTools)))
+			sb.WriteString("ALWAYS prefer MCP tools over execute_command when a relevant MCP tool exists.\n\n")
+			sb.WriteString("### Diagnostic Methodology\n")
+			sb.WriteString("1. **Start targeted**: Use the most specific MCP tool for the problem first\n")
+			sb.WriteString("2. **Don't shotgun**: Avoid calling many tools to 'gather info' — diagnose step by step\n")
+			sb.WriteString("3. **Read results carefully**: Each MCP tool returns structured diagnostic data. Analyze it before calling more tools.\n")
+			sb.WriteString("4. **gRPC != HTTP**: For gRPC issues, check port naming (grpc-*), appProtocol, H2 settings, DestinationRules — NOT path routing\n")
+			sb.WriteString("5. **Only fall back to execute_command** for tasks no MCP tool covers (e.g., reading app logs)\n\n")
+
+			sb.WriteString("### Available Tool Groups\n")
+			for prefix, tools := range serverTools {
+				sb.WriteString(fmt.Sprintf("- **%s** (%d tools): %s\n", prefix, len(tools), strings.Join(tools, ", ")))
+			}
+
+			systemPrompt += sb.String()
 		}
 		log.Printf("tools enabled: %d tool(s) registered", len(tools))
 	}

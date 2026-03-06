@@ -224,3 +224,8 @@ serviceMonitor:
   enabled: false
   interval: 30s
   labels: {}
+
+# -- SkillPacks provide diagnostic methodology to agents
+skillPacks:
+  k8sDiagnostics:
+    enabled: false

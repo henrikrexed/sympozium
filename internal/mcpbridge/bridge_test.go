@@ -393,3 +393,63 @@ func TestDiscoverAndWriteManifest(t *testing.T) {
 		t.Errorf("tool[0].Name = %q, want %q", manifest.Tools[0].Name, "k8s_get_pods")
 	}
 }
+
+func TestExtractTraceparent(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		valid   bool
+		traceID string
+		spanID  string
+		sampled bool
+	}{
+		{
+			name:    "valid sampled",
+			input:   "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+			valid:   true,
+			traceID: "4bf92f3577b34da6a3ce929d0e0e4736",
+			spanID:  "00f067aa0ba902b7",
+			sampled: true,
+		},
+		{
+			name:    "valid not sampled",
+			input:   "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+			valid:   true,
+			traceID: "4bf92f3577b34da6a3ce929d0e0e4736",
+			spanID:  "00f067aa0ba902b7",
+			sampled: false,
+		},
+		{name: "empty string", input: "", valid: false},
+		{name: "wrong version", input: "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", valid: false},
+		{name: "too few parts", input: "00-abc-01", valid: false},
+		{name: "invalid trace id", input: "00-invalidtraceid-00f067aa0ba902b7-01", valid: false},
+		{name: "invalid span id", input: "00-4bf92f3577b34da6a3ce929d0e0e4736-invalidspan-01", valid: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sc := extractTraceparent(tt.input)
+			if tt.valid {
+				if !sc.IsValid() {
+					t.Fatal("expected valid SpanContext")
+				}
+				if sc.TraceID().String() != tt.traceID {
+					t.Errorf("traceID = %s, want %s", sc.TraceID(), tt.traceID)
+				}
+				if sc.SpanID().String() != tt.spanID {
+					t.Errorf("spanID = %s, want %s", sc.SpanID(), tt.spanID)
+				}
+				if sc.IsSampled() != tt.sampled {
+					t.Errorf("sampled = %v, want %v", sc.IsSampled(), tt.sampled)
+				}
+				if !sc.IsRemote() {
+					t.Error("expected remote=true")
+				}
+			} else {
+				if sc.IsValid() {
+					t.Error("expected invalid SpanContext")
+				}
+			}
+		})
+	}
+}

@@ -232,8 +232,16 @@ func (b *Bridge) handleRequest(ctx context.Context, path string) {
 		}
 	}
 
+	// Extract trace context from agent-runner's _meta
+	parentCtx := ctx
+	if tp, ok := req.Meta["traceparent"]; ok {
+		if remoteCtx := extractTraceparent(tp); remoteCtx.IsValid() {
+			parentCtx = trace.ContextWithRemoteSpanContext(ctx, remoteCtx)
+		}
+	}
+
 	// Start a span for the tool call
-	ctx, span := bridgeTracer.Start(ctx, "mcp.tool_call",
+	ctx, span := bridgeTracer.Start(parentCtx, "mcp.tool_call",
 		trace.WithAttributes(
 			attribute.String("mcp.tool", toolName),
 			attribute.String("mcp.server", serverName),
@@ -404,4 +412,35 @@ func (b *Bridge) DiscoverAndWriteManifest(ctx context.Context) error {
 
 	log.Printf("Wrote tool manifest with %d tools to %s", len(manifest.Tools), b.manifestPath)
 	return nil
+}
+
+// extractTraceparent parses a W3C traceparent header into a SpanContext.
+// Format: 00-<trace-id>-<span-id>-<flags>
+func extractTraceparent(tp string) trace.SpanContext {
+	parts := strings.Split(tp, "-")
+	if len(parts) != 4 || parts[0] != "00" {
+		return trace.SpanContext{}
+	}
+
+	traceID, err := trace.TraceIDFromHex(parts[1])
+	if err != nil {
+		return trace.SpanContext{}
+	}
+
+	spanID, err := trace.SpanIDFromHex(parts[2])
+	if err != nil {
+		return trace.SpanContext{}
+	}
+
+	var flags trace.TraceFlags
+	if parts[3] == "01" {
+		flags = trace.FlagsSampled
+	}
+
+	return trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: flags,
+		Remote:     true,
+	})
 }
