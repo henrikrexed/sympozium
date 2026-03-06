@@ -176,7 +176,7 @@ func TestBuildJob_CustomSeccompProfile(t *testing.T) {
 
 func TestBuildContainers_BasicCount(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, nil)
 	// agent + ipc-bridge = 2
 	if len(cs) != 2 {
 		t.Fatalf("container count = %d, want 2", len(cs))
@@ -185,7 +185,7 @@ func TestBuildContainers_BasicCount(t *testing.T) {
 
 func TestBuildContainers_AgentImage(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, nil)
 	// agent container should reference agent-runner image
 	if cs[0].Name != "agent" {
 		t.Fatalf("first container name = %q, want agent", cs[0].Name)
@@ -197,7 +197,7 @@ func TestBuildContainers_AgentImage(t *testing.T) {
 
 func TestBuildContainers_IPCBridgeImage(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, nil)
 	if cs[1].Name != "ipc-bridge" {
 		t.Fatalf("second container name = %q, want ipc-bridge", cs[1].Name)
 	}
@@ -209,7 +209,7 @@ func TestBuildContainers_IPCBridgeImage(t *testing.T) {
 func TestBuildContainers_AgentEnvVars(t *testing.T) {
 	r := &AgentRunReconciler{}
 	run := newTestRun()
-	cs := r.buildContainers(run, false, nil, nil, nil)
+	cs, _ := r.buildContainers(run, false, nil, nil, nil)
 
 	envMap := map[string]string{}
 	for _, e := range cs[0].Env {
@@ -229,7 +229,7 @@ func TestBuildContainers_AgentEnvVars(t *testing.T) {
 func TestBuildContainers_AuthSecretRef(t *testing.T) {
 	r := &AgentRunReconciler{}
 	run := newTestRun()
-	cs := r.buildContainers(run, false, nil, nil, nil)
+	cs, _ := r.buildContainers(run, false, nil, nil, nil)
 
 	if len(cs[0].EnvFrom) == 0 {
 		t.Fatal("expected envFrom for auth secret")
@@ -243,7 +243,7 @@ func TestBuildContainers_NoAuthSecretRef(t *testing.T) {
 	r := &AgentRunReconciler{}
 	run := newTestRun()
 	run.Spec.Model.AuthSecretRef = ""
-	cs := r.buildContainers(run, false, nil, nil, nil)
+	cs, _ := r.buildContainers(run, false, nil, nil, nil)
 
 	if len(cs[0].EnvFrom) != 0 {
 		t.Errorf("envFrom should be empty for no-auth providers, got %d", len(cs[0].EnvFrom))
@@ -252,7 +252,7 @@ func TestBuildContainers_NoAuthSecretRef(t *testing.T) {
 
 func TestBuildContainers_AgentSecurityContext(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, nil)
 
 	sc := cs[0].SecurityContext
 	if sc == nil {
@@ -265,7 +265,7 @@ func TestBuildContainers_AgentSecurityContext(t *testing.T) {
 
 func TestBuildContainers_AgentVolumeMounts(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, nil)
 
 	mounts := map[string]bool{}
 	for _, m := range cs[0].VolumeMounts {
@@ -280,7 +280,7 @@ func TestBuildContainers_AgentVolumeMounts(t *testing.T) {
 
 func TestBuildContainers_AgentResources(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, nil)
 
 	req := cs[0].Resources.Requests
 	if req.Cpu().Cmp(resource.MustParse("250m")) != 0 {
@@ -294,7 +294,7 @@ func TestBuildContainers_AgentResources(t *testing.T) {
 func TestBuildContainers_IPCBridgeEnvVars(t *testing.T) {
 	r := &AgentRunReconciler{}
 	run := newTestRun()
-	cs := r.buildContainers(run, false, nil, nil, nil)
+	cs, _ := r.buildContainers(run, false, nil, nil, nil)
 
 	envMap := map[string]string{}
 	for _, e := range cs[1].Env {
@@ -312,7 +312,7 @@ func TestBuildContainers_WithSandbox(t *testing.T) {
 	r := &AgentRunReconciler{}
 	run := newTestRun()
 	run.Spec.Sandbox = &sympoziumv1alpha1.AgentRunSandboxSpec{Enabled: true}
-	cs := r.buildContainers(run, false, nil, nil, nil)
+	cs, _ := r.buildContainers(run, false, nil, nil, nil)
 	// agent + ipc-bridge + sandbox = 3
 	if len(cs) != 3 {
 		t.Fatalf("container count = %d, want 3", len(cs))
@@ -329,7 +329,7 @@ func TestBuildContainers_SandboxCustomImage(t *testing.T) {
 		Enabled: true,
 		Image:   "my-sandbox:v1",
 	}
-	cs := r.buildContainers(run, false, nil, nil, nil)
+	cs, _ := r.buildContainers(run, false, nil, nil, nil)
 	if cs[2].Image != "my-sandbox:v1" {
 		t.Errorf("sandbox image = %q, want my-sandbox:v1", cs[2].Image)
 	}
@@ -339,7 +339,7 @@ func TestBuildContainers_SandboxDisabled(t *testing.T) {
 	r := &AgentRunReconciler{}
 	run := newTestRun()
 	run.Spec.Sandbox = &sympoziumv1alpha1.AgentRunSandboxSpec{Enabled: false}
-	cs := r.buildContainers(run, false, nil, nil, nil)
+	cs, _ := r.buildContainers(run, false, nil, nil, nil)
 	if len(cs) != 2 {
 		t.Errorf("container count = %d, want 2 (sandbox disabled)", len(cs))
 	}
@@ -512,7 +512,7 @@ func TestBuildVolumes_MemoryDisabled(t *testing.T) {
 func TestBuildContainers_MemoryMount(t *testing.T) {
 	r := &AgentRunReconciler{}
 	run := newTestRun()
-	cs := r.buildContainers(run, true, nil, nil, nil)
+	cs, _ := r.buildContainers(run, true, nil, nil, nil)
 
 	agent := cs[0]
 	var hasMount bool
@@ -555,7 +555,7 @@ func TestBuildContainers_SkillSidecarInjected(t *testing.T) {
 			},
 		},
 	}
-	cs := r.buildContainers(newTestRun(), false, nil, sidecars, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, sidecars, nil)
 	// agent + ipc-bridge + skill sidecar = 3
 	if len(cs) != 3 {
 		t.Fatalf("container count = %d, want 3", len(cs))
@@ -591,7 +591,7 @@ func TestBuildContainers_SkillSidecarDefaultCommand(t *testing.T) {
 			},
 		},
 	}
-	cs := r.buildContainers(newTestRun(), false, nil, sidecars, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, sidecars, nil)
 	sc := cs[2]
 	// When no command is specified in the SkillPack, the container should
 	// have no Command override so the image's default CMD runs.
@@ -622,7 +622,7 @@ func TestBuildContainers_MultipleSkillSidecars(t *testing.T) {
 		{skillPackName: "skill-a", sidecar: sympoziumv1alpha1.SkillSidecar{Image: "a:latest", MountWorkspace: true}},
 		{skillPackName: "skill-b", sidecar: sympoziumv1alpha1.SkillSidecar{Image: "b:latest", MountWorkspace: true}},
 	}
-	cs := r.buildContainers(newTestRun(), false, nil, sidecars, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, sidecars, nil)
 	// agent + ipc-bridge + 2 sidecars = 4
 	if len(cs) != 4 {
 		t.Fatalf("container count = %d, want 4", len(cs))
@@ -660,7 +660,7 @@ func TestBuildContainers_ObservabilityEnv(t *testing.T) {
 		},
 	}
 
-	cs := r.buildContainers(run, false, obs, nil, nil)
+	cs, _ := r.buildContainers(run, false, obs, nil, nil)
 
 	agentEnv := map[string]string{}
 	for _, e := range cs[0].Env {
@@ -694,7 +694,7 @@ func TestBuildContainers_PrivilegedSidecarUnconfinedSeccomp(t *testing.T) {
 			},
 		},
 	}
-	cs := r.buildContainers(newTestRun(), false, nil, sidecars, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, sidecars, nil)
 
 	sidecar := cs[2] // agent, ipc-bridge, then skill sidecar
 	if sidecar.SecurityContext == nil {
@@ -719,7 +719,7 @@ func TestBuildContainers_NonPrivilegedSidecarNoSeccompOverride(t *testing.T) {
 			},
 		},
 	}
-	cs := r.buildContainers(newTestRun(), false, nil, sidecars, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, sidecars, nil)
 
 	sidecar := cs[2]
 	if sidecar.SecurityContext != nil {
@@ -729,7 +729,7 @@ func TestBuildContainers_NonPrivilegedSidecarNoSeccompOverride(t *testing.T) {
 
 func TestBuildContainers_IPCBridgeSecurityContext(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, nil)
 
 	ipc := cs[1]
 	if ipc.SecurityContext == nil {
@@ -770,7 +770,7 @@ func testMCPServers() []sympoziumv1alpha1.MCPServerRef {
 func TestBuildContainers_WithMCPBridge(t *testing.T) {
 	r := &AgentRunReconciler{}
 	mcpServers := testMCPServers()
-	cs := r.buildContainers(newTestRun(), false, nil, nil, mcpServers)
+	cs, initCs := r.buildContainers(newTestRun(), false, nil, nil, mcpServers)
 	// agent + ipc-bridge + mcp-bridge = 3
 	if len(cs) != 3 {
 		t.Fatalf("container count = %d, want 3", len(cs))
@@ -779,11 +779,28 @@ func TestBuildContainers_WithMCPBridge(t *testing.T) {
 	if mcpBridge.Name != "mcp-bridge" {
 		t.Errorf("third container name = %q, want mcp-bridge", mcpBridge.Name)
 	}
+	// init container: mcp-discover
+	if len(initCs) != 1 {
+		t.Fatalf("init container count = %d, want 1", len(initCs))
+	}
+	if initCs[0].Name != "mcp-discover" {
+		t.Errorf("init container name = %q, want mcp-discover", initCs[0].Name)
+	}
+	// Verify MCP_DISCOVER_ONLY env var
+	var hasDiscoverOnly bool
+	for _, e := range initCs[0].Env {
+		if e.Name == "MCP_DISCOVER_ONLY" && e.Value == "true" {
+			hasDiscoverOnly = true
+		}
+	}
+	if !hasDiscoverOnly {
+		t.Error("init container missing MCP_DISCOVER_ONLY=true env var")
+	}
 }
 
 func TestBuildContainers_MCPBridgeImage(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, testMCPServers())
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, testMCPServers())
 	mcpBridge := cs[2]
 	if mcpBridge.Image == "" {
 		t.Error("mcp-bridge image is empty")
@@ -792,7 +809,7 @@ func TestBuildContainers_MCPBridgeImage(t *testing.T) {
 
 func TestBuildContainers_MCPBridgeEnvVars(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, testMCPServers())
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, testMCPServers())
 	mcpBridge := cs[2]
 
 	envMap := map[string]string{}
@@ -812,7 +829,7 @@ func TestBuildContainers_MCPBridgeEnvVars(t *testing.T) {
 
 func TestBuildContainers_MCPBridgeAuthSecretEnv(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, testMCPServers())
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, testMCPServers())
 	mcpBridge := cs[2]
 
 	// Should have auth env var for otel-collector (has AuthSecret)
@@ -839,7 +856,7 @@ func TestBuildContainers_MCPBridgeAuthSecretEnv(t *testing.T) {
 
 func TestBuildContainers_MCPBridgeSecurityContext(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, testMCPServers())
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, testMCPServers())
 	mcpBridge := cs[2]
 
 	sc := mcpBridge.SecurityContext
@@ -859,7 +876,7 @@ func TestBuildContainers_MCPBridgeSecurityContext(t *testing.T) {
 
 func TestBuildContainers_MCPBridgeVolumeMounts(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, testMCPServers())
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, testMCPServers())
 	mcpBridge := cs[2]
 
 	mounts := map[string]string{}
@@ -876,7 +893,7 @@ func TestBuildContainers_MCPBridgeVolumeMounts(t *testing.T) {
 
 func TestBuildContainers_MCPBridgeResources(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, testMCPServers())
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, testMCPServers())
 	mcpBridge := cs[2]
 
 	req := mcpBridge.Resources.Requests
@@ -890,7 +907,7 @@ func TestBuildContainers_MCPBridgeResources(t *testing.T) {
 
 func TestBuildContainers_NoMCPBridgeWhenNoServers(t *testing.T) {
 	r := &AgentRunReconciler{}
-	cs := r.buildContainers(newTestRun(), false, nil, nil, nil)
+	cs, _ := r.buildContainers(newTestRun(), false, nil, nil, nil)
 	// agent + ipc-bridge = 2
 	if len(cs) != 2 {
 		t.Fatalf("container count = %d, want 2 (no MCP servers)", len(cs))
@@ -905,7 +922,7 @@ func TestBuildContainers_MCPBridgeWithOTel(t *testing.T) {
 		Enabled:      true,
 		OTLPEndpoint: "otel-collector:4317",
 	}
-	cs := r.buildContainers(run, false, obs, nil, testMCPServers())
+	cs, _ := r.buildContainers(run, false, obs, nil, testMCPServers())
 	mcpBridge := cs[2]
 
 	envMap := map[string]string{}
