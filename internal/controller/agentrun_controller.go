@@ -413,7 +413,7 @@ func (r *AgentRunReconciler) reconcileRunning(ctx context.Context, log logr.Logg
 	// Check timeout (explicit spec timeout or hard default for scheduled runs).
 	if agentRun.Status.StartedAt != nil {
 		elapsed := time.Since(agentRun.Status.StartedAt.Time)
-		timeout := 10 * time.Minute // default hard timeout
+		timeout := 20 * time.Minute // default hard timeout
 		if agentRun.Spec.Timeout != nil {
 			timeout = agentRun.Spec.Timeout.Duration
 		}
