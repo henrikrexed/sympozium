@@ -7,7 +7,8 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -mod=mod -ldflags="-s -w" -o /mcp-bridge ./cmd/mcp-bridge
 
-FROM gcr.io/distroless/static:nonroot
-COPY --from=builder /mcp-bridge /mcp-bridge
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /mcp-bridge /usr/local/bin/mcp-bridge
 USER 65532:65532
-ENTRYPOINT ["/mcp-bridge"]
+ENTRYPOINT ["/usr/local/bin/mcp-bridge"]
