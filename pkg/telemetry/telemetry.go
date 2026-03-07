@@ -20,6 +20,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
@@ -108,11 +109,14 @@ func Init(ctx context.Context, cfg Config) (*Telemetry, error) {
 
 	// Always register W3C propagator so Extract/Inject works even in noop mode.
 	otel.SetTextMapPropagator(propagation.TraceContext{})
-
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
 		return initNoop(cfg), nil
 	}
+
+	// Strip http:// or https:// scheme - gRPC exporter expects host:port only.
+	endpoint = strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")
+	os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
 
 	res, err := buildResource(cfg)
 	if err != nil {
