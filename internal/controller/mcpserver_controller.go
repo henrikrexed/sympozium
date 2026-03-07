@@ -143,7 +143,7 @@ func (r *MCPServerReconciler) reconcileDeployment(ctx context.Context, ms *sympo
 		deploy.Spec.Template.ObjectMeta = metav1.ObjectMeta{Labels: labels}
 
 		if ms.Spec.TransportType == "stdio" {
-			r.buildStdioPodSpec(ms, &deploy.Spec.Template.Spec)
+			r.buildStdioPodSpec(ctx, ms, &deploy.Spec.Template.Spec)
 		} else {
 			r.buildHTTPPodSpec(ms, &deploy.Spec.Template.Spec)
 		}
@@ -156,7 +156,7 @@ func (r *MCPServerReconciler) reconcileDeployment(ctx context.Context, ms *sympo
 	return nil
 }
 
-func (r *MCPServerReconciler) buildStdioPodSpec(ms *sympoziumv1alpha1.MCPServer, podSpec *corev1.PodSpec) {
+func (r *MCPServerReconciler) buildStdioPodSpec(ctx context.Context, ms *sympoziumv1alpha1.MCPServer, podSpec *corev1.PodSpec) {
 	dep := ms.Spec.Deployment
 	bridgeImage := r.mcpBridgeImage()
 
@@ -184,14 +184,26 @@ func (r *MCPServerReconciler) buildStdioPodSpec(ms *sympoziumv1alpha1.MCPServer,
 		env = append(env, corev1.EnvVar{Name: "STDIO_ENV_" + k, Value: v})
 	}
 
-	// EnvFrom for secrets
-	var envFrom []corev1.EnvFromSource
+	// For stdio transport, secret env vars must be prefixed with STDIO_ENV_
+	// so the adapter passes them to the child process.
+	// We look up secret keys and create individual EnvVar entries with secretKeyRef.
 	for _, ref := range dep.SecretRefs {
-		envFrom = append(envFrom, corev1.EnvFromSource{
-			SecretRef: &corev1.SecretEnvSource{
-				LocalObjectReference: corev1.LocalObjectReference{Name: ref.Name},
-			},
-		})
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: ms.Namespace, Name: ref.Name}, secret); err != nil {
+			ctrl.LoggerFrom(ctx).Error(err, "failed to look up secret for STDIO_ENV prefixing", "secret", ref.Name)
+			continue
+		}
+		for key := range secret.Data {
+			env = append(env, corev1.EnvVar{
+				Name: "STDIO_ENV_" + key,
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: ref.Name},
+						Key:                  key,
+					},
+				},
+			})
+		}
 	}
 
 	container := corev1.Container{
@@ -200,7 +212,7 @@ func (r *MCPServerReconciler) buildStdioPodSpec(ms *sympoziumv1alpha1.MCPServer,
 		Command: []string{"/adapter/mcp-bridge"},
 		Args:    []string{"--stdio-adapter"},
 		Env:     env,
-		EnvFrom: envFrom,
+		
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "adapter-bin", MountPath: "/adapter"},
 		},
@@ -245,8 +257,8 @@ func (r *MCPServerReconciler) buildHTTPPodSpec(ms *sympoziumv1alpha1.MCPServer, 
 	for k, v := range dep.Env {
 		env = append(env, corev1.EnvVar{Name: k, Value: v})
 	}
-
 	var envFrom []corev1.EnvFromSource
+
 	for _, ref := range dep.SecretRefs {
 		envFrom = append(envFrom, corev1.EnvFromSource{
 			SecretRef: &corev1.SecretEnvSource{
