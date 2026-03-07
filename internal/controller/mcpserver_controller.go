@@ -212,7 +212,7 @@ func (r *MCPServerReconciler) buildStdioPodSpec(ctx context.Context, ms *sympozi
 		Command: []string{"/adapter/mcp-bridge"},
 		Args:    []string{"--stdio-adapter"},
 		Env:     env,
-		
+
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "adapter-bin", MountPath: "/adapter"},
 		},
