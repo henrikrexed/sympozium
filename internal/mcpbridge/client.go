@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -149,6 +150,8 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 	for k, v := range c.serverConfig.Headers {
 		httpReq.Header.Set(k, v)
 	}
+	// Propagate W3C trace context to MCP server
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
