@@ -773,13 +773,19 @@ func (r *AgentRunReconciler) buildContainers(
 		agentEnv = append(agentEnv, corev1.EnvVar{Name: "TRACEPARENT", Value: tp})
 		ipcEnv = append(ipcEnv, corev1.EnvVar{Name: "TRACEPARENT", Value: tp})
 	}
+	endpoint := ""
 	if observability != nil && observability.OTLPEndpoint != "" {
+		endpoint = observability.OTLPEndpoint
+	} else {
+		endpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	}
+	if endpoint != "" {
 		agentEnv = append(agentEnv,
-			corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: observability.OTLPEndpoint},
+			corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: endpoint},
 			corev1.EnvVar{Name: "OTEL_SERVICE_NAME", Value: "sympozium-agent-runner"},
 		)
 		ipcEnv = append(ipcEnv,
-			corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: observability.OTLPEndpoint},
+			corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: endpoint},
 			corev1.EnvVar{Name: "OTEL_SERVICE_NAME", Value: "sympozium-ipc-bridge"},
 		)
 	}
@@ -1164,10 +1170,14 @@ func buildObservabilityEnv(agentRun *sympoziumv1alpha1.AgentRun, obs *sympoziumv
 		{Name: "SYMPOZIUM_OTEL_ENABLED", Value: "true"},
 	}
 
-	if obs.OTLPEndpoint != "" {
+	otlpEndpoint := obs.OTLPEndpoint
+	if otlpEndpoint == "" {
+		otlpEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	}
+	if otlpEndpoint != "" {
 		env = append(env,
-			corev1.EnvVar{Name: "SYMPOZIUM_OTEL_OTLP_ENDPOINT", Value: obs.OTLPEndpoint},
-			corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: obs.OTLPEndpoint},
+			corev1.EnvVar{Name: "SYMPOZIUM_OTEL_OTLP_ENDPOINT", Value: otlpEndpoint},
+			corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: otlpEndpoint},
 		)
 	}
 	if obs.OTLPProtocol != "" {
