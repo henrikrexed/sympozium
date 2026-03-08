@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -46,9 +47,9 @@ func (m *StdioManager) Start() error {
 
 func (m *StdioManager) startLocked() error {
 	cmd := exec.Command(m.cmdPath, m.args...)
-	if len(m.env) > 0 {
-		cmd.Env = m.env
-	}
+	// Inherit parent environment and append child-specific vars.
+	// Without this, the child process loses PATH, HOME, etc.
+	cmd.Env = append(os.Environ(), m.env...)
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
