@@ -133,11 +133,16 @@ defaultPolicies:
   # -- Install built-in policy presets
   enabled: true
 
-# -- Default SkillPacks to install (code-review, incident-response, k8s-ops, sre-observability, llmfit)
+# -- Default SkillPacks to install (code-review, incident-response, k8s-ops, sre-observability, llmfit, github-gitops, software-dev)
 defaultSkills:
   enabled: true
   # -- List of SkillPack specs
   skills: []
+
+# -- Default PersonaPacks to install (developer-team)
+defaultPersonas:
+  # -- Install built-in persona pack definitions (disabled by default, must be activated after install)
+  enabled: true
 
 # -- Pod security context (applied to all control plane pods)
 securityContext:

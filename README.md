@@ -379,6 +379,7 @@ All generated resources have `ownerReferences` pointing back to the PersonaPack 
 |------|----------|--------|-------------|
 | `platform-team` | Platform | Security Guardian, SRE Watchdog, Platform Engineer | Core platform engineering — security audits, cluster health, manifest review |
 | `devops-essentials` | DevOps | Incident Responder, Cost Analyzer | DevOps workflows — incident triage, resource right-sizing |
+| `developer-team` | Development | Tech Lead, Backend Dev, Frontend Dev, QA Engineer, Code Reviewer, DevOps Engineer, Docs Writer | A 2-pizza software development team that collaborates on a single GitHub repository through PRs, issues, code review, testing, and documentation |
 
 **Activating a pack in the TUI:**
 

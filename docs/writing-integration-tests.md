@@ -268,3 +268,4 @@ not after it completes. The Job/pod is cleaned up quickly after the agent finish
 | k8s-ops nodes | `test/integration/test-k8s-ops-nodes.sh` | Agent uses `execute_command` with k8s-ops skill to run `kubectl get nodes` |
 | telegram | `test/integration/test-telegram-channel.sh` | Channel deployment pipeline + optional full E2E with real bot |
 | slack | `test/integration/test-slack-channel.sh` | Channel deployment pipeline + optional full E2E via Socket Mode |
+| developer-team | `test/integration/developer_team_test.sh` | End-to-end PersonaPack simulation — 7 developer agents collaborate on a real GitHub repo (issues, PRs, code review, QA). Requires `GITHUB_TOKEN` with repo scope |
