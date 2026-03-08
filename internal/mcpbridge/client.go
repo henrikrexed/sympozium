@@ -46,9 +46,11 @@ func NewClient(cfg ServerConfig) *Client {
 }
 
 // DiscoverTools initializes the MCP session and lists available tools.
+// If initialize fails, it falls back to listing tools directly (some servers
+// like Dynatrace MCP do not implement the initialize handshake over stdio).
 func (c *Client) DiscoverTools(ctx context.Context) ([]MCPTool, error) {
 	if err := c.initialize(ctx); err != nil {
-		return nil, fmt.Errorf("initialize: %w", err)
+		log.Printf("WARNING: initialize failed for %q, trying tools/list directly: %v", c.serverConfig.Name, err)
 	}
 	return c.listTools(ctx)
 }
