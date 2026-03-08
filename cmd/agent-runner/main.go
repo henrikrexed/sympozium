@@ -19,6 +19,7 @@ import (
 	"github.com/openai/openai-go/v3/shared"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // maxToolIterations is the maximum number of tool-call round-trips before
@@ -174,6 +175,13 @@ func main() {
 			log.Printf("failed to shutdown OTel providers: %v", err)
 		}
 	}()
+
+	// Extract TRACEPARENT from env so the runner trace joins the controller trace.
+	if tp := os.Getenv("TRACEPARENT"); tp != "" {
+		prop := propagation.TraceContext{}
+		carrier := propagation.MapCarrier{"traceparent": tp}
+		ctx = prop.Extract(ctx, carrier)
+	}
 
 	ctx, runSpan := obs.startRunSpan(ctx,
 		attribute.String("instance", getEnv("INSTANCE_NAME", "")),
