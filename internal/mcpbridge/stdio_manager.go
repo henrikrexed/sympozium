@@ -70,7 +70,6 @@ func (m *StdioManager) startLocked() error {
 		}
 	}
 	cmd.Env = append(childEnv, m.env...)
-	log.Printf("stdio child env (%d vars): %v", len(cmd.Env), cmd.Env)
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
