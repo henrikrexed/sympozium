@@ -253,8 +253,8 @@ func readFileTool(args map[string]any) string {
 	}
 
 	content := string(data)
-	if len(content) > 100_000 {
-		content = content[:100_000] + fmt.Sprintf("\n... (truncated, file is %d bytes)", len(data))
+	if len(content) > 8_000 {
+		content = content[:8_000] + fmt.Sprintf("\n... (truncated, file is %d bytes)", len(data))
 	}
 	return content
 }
@@ -724,8 +724,8 @@ func formatExecResult(r execResult) string {
 	if output == "" {
 		output = "(no output)"
 	}
-	if len(output) > 50_000 {
-		output = output[:50_000] + "\n... (output truncated)"
+	if len(output) > 8_000 {
+		output = output[:8_000] + "\n... (output truncated)"
 	}
 	return output
 }

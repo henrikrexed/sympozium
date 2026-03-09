@@ -250,9 +250,9 @@ func formatMCPResult(r mcpResult) string {
 	if output == "" {
 		output = "(no output)"
 	}
-	if len(output) > 50_000 {
+	if len(output) > 8_000 {
 		// Truncate at a valid UTF-8 boundary
-		truncated := output[:50_000]
+		truncated := output[:8_000]
 		for !utf8.ValidString(truncated) && len(truncated) > 0 {
 			truncated = truncated[:len(truncated)-1]
 		}
