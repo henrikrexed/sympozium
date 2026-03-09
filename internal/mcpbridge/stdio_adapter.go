@@ -32,6 +32,7 @@ var (
 
 // jsonRPCRequest is a minimal JSON-RPC 2.0 request envelope for method extraction.
 type jsonRPCRequest struct {
+	ID     json.RawMessage `json:"id,omitempty"`
 	Method string          `json:"method"`
 	Params json.RawMessage `json:"params,omitempty"`
 }
@@ -130,6 +131,23 @@ func (a *StdioAdapter) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	if !a.manager.IsAlive() {
 		span.SetStatus(codes.Error, "stdio process not alive")
 		http.Error(w, `{"error":"stdio process not alive"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	// MCP notifications (no "id" field) don't expect a response.
+	// Write to stdin but don't wait for a reply.
+	if rpcReq.ID == nil {
+		log.Printf("stdio adapter: notification %q (no id), write-only", rpcReq.Method)
+		err := a.manager.WriteOnly(ctx, body)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusBadGateway)
+			return
+		}
+		span.SetStatus(codes.Ok, "")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"jsonrpc":"2.0"}`))
 		return
 	}
 

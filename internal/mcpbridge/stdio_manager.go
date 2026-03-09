@@ -264,3 +264,23 @@ func (m *StdioManager) IsAlive() bool {
 	defer m.mu.Unlock()
 	return m.alive
 }
+
+// WriteOnly writes a message to stdin without waiting for a response.
+// Used for MCP notifications which have no id and expect no reply.
+func (m *StdioManager) WriteOnly(ctx context.Context, request []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.alive {
+		return fmt.Errorf("stdio process is not alive")
+	}
+
+	msg := make([]byte, len(request)+1)
+	copy(msg, request)
+	msg[len(request)] = '\n'
+	log.Printf("stdio WriteOnly: writing %d bytes to stdin (notification)", len(msg))
+	if _, err := m.stdin.Write(msg); err != nil {
+		return fmt.Errorf("write to stdin: %w", err)
+	}
+	return nil
+}
