@@ -539,7 +539,28 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 		}
 
 		// No tool calls — return the text response.
-		return choice.Message.Content, totalInputTokens, totalOutputTokens, totalToolCalls, nil
+		responseContent := choice.Message.Content
+
+		// Reasoning models (gpt-oss, o1, etc.) may return an empty Content field
+		// with all output in a "reasoning" field that the SDK doesn't expose.
+		// Fall back to extracting reasoning from the raw JSON if Content is empty.
+		if responseContent == "" {
+			raw := choice.Message.RawJSON()
+			if raw != "" {
+				var rawMsg map[string]interface{}
+				if err := json.Unmarshal([]byte(raw), &rawMsg); err == nil {
+					if reasoning, ok := rawMsg["reasoning"].(string); ok && reasoning != "" {
+						log.Printf("WARNING: Message.Content empty but reasoning field found (%d chars) - using reasoning as response", len(reasoning))
+						responseContent = reasoning
+					} else if reasoningContent, ok := rawMsg["reasoning_content"].(string); ok && reasoningContent != "" {
+						log.Printf("WARNING: Message.Content empty but reasoning_content field found (%d chars) - using as response", len(reasoningContent))
+						responseContent = reasoningContent
+					}
+				}
+			}
+		}
+
+		return responseContent, totalInputTokens, totalOutputTokens, totalToolCalls, nil
 	}
 
 	return "", totalInputTokens, totalOutputTokens, totalToolCalls,
