@@ -63,7 +63,7 @@ func (c *Client) CallTool(ctx context.Context, name string, arguments json.RawMe
 // initialize sends the MCP initialize request to establish a session.
 func (c *Client) initialize(ctx context.Context) error {
 	params := MCPInitializeParams{
-		ProtocolVersion: "2025-03-26",
+		ProtocolVersion: "2024-11-05",
 		Capabilities:    MCPCapabilities{},
 		ClientInfo: MCPImplementation{
 			Name:    "sympozium-mcp-bridge",
