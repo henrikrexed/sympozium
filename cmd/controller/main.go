@@ -36,6 +36,22 @@ func init() {
 	utilruntime.Must(gatewayv1.Install(scheme))
 }
 
+// crdInstalled checks whether a specific CRD (group/version/resource) is registered
+// in the API server's discovery information. Returns false if the resource is not found
+// or the API server is unreachable for that group/version.
+func crdInstalled(group, version, resource string, clientset kubernetes.Interface) bool {
+	resources, err := clientset.Discovery().ServerResourcesForGroupVersion(group + "/" + version)
+	if err != nil {
+		return false
+	}
+	for _, r := range resources.APIResources {
+		if r.Name == resource {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	var metricsAddr string
 	var probeAddr string
@@ -162,13 +178,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.SympoziumConfigReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Log:    ctrl.Log.WithName("controllers").WithName("SympoziumConfig"),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "SympoziumConfig")
-		os.Exit(1)
+	// SympoziumConfig CRD is optional — skip the controller if the CRD is not installed.
+	if crdInstalled("sympozium.ai", "v1alpha1", "sympoziumconfigs", clientset) {
+		if err := (&controller.SympoziumConfigReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+			Log:    ctrl.Log.WithName("controllers").WithName("SympoziumConfig"),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "SympoziumConfig")
+			os.Exit(1)
+		}
+	} else {
+		setupLog.Info("SympoziumConfig CRD not found — skipping controller registration (install the CRD to enable gateway features)")
 	}
 
 	// --- Channel message router (optional — requires NATS) ---
