@@ -541,20 +541,42 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 		// No tool calls — return the text response.
 		responseContent := choice.Message.Content
 
+		// Debug: log raw Content and RawJSON length for diagnosing reasoning-model issues.
+		rawJSON := choice.Message.RawJSON()
+		log.Printf("DEBUG: Message.Content=%q (len=%d), RawJSON len=%d", responseContent, len(responseContent), len(rawJSON))
+
+		// Whitespace-only content is effectively empty.
+		responseContent = strings.TrimSpace(responseContent)
+
 		// Reasoning models (gpt-oss, o1, etc.) may return an empty Content field
 		// with all output in a "reasoning" field that the SDK doesn't expose.
 		// Fall back to extracting reasoning from the raw JSON if Content is empty.
 		if responseContent == "" {
-			raw := choice.Message.RawJSON()
-			if raw != "" {
+			if rawJSON != "" {
 				var rawMsg map[string]interface{}
-				if err := json.Unmarshal([]byte(raw), &rawMsg); err == nil {
+				if err := json.Unmarshal([]byte(rawJSON), &rawMsg); err == nil {
 					if reasoning, ok := rawMsg["reasoning"].(string); ok && reasoning != "" {
 						log.Printf("WARNING: Message.Content empty but reasoning field found (%d chars) - using reasoning as response", len(reasoning))
 						responseContent = reasoning
 					} else if reasoningContent, ok := rawMsg["reasoning_content"].(string); ok && reasoningContent != "" {
 						log.Printf("WARNING: Message.Content empty but reasoning_content field found (%d chars) - using as response", len(reasoningContent))
 						responseContent = reasoningContent
+					}
+				}
+			}
+
+			// Additional fallback: check SDK ExtraFields for reasoning.
+			if responseContent == "" {
+				if ef := choice.Message.JSON.ExtraFields; ef != nil {
+					for _, key := range []string{"reasoning", "reasoning_content"} {
+						if field, ok := ef[key]; ok {
+							var val string
+							if err := json.Unmarshal([]byte(field.Raw()), &val); err == nil && strings.TrimSpace(val) != "" {
+								log.Printf("WARNING: Using ExtraFields[%q] (%d chars) as response", key, len(val))
+								responseContent = val
+								break
+							}
+						}
 					}
 				}
 			}
