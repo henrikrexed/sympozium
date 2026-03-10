@@ -122,6 +122,87 @@ spec:
 
 **What happens:** No Deployment is created. The controller just validates the URL and exposes it in `status.url` for agents to use.
 
+## Tool Filtering
+
+MCP servers can expose dozens of tools. For example, `k8s-networking-mcp` exposes 42 tools, each costing ~300 tokens in the agent's context window. If your agent only needs a subset, you can filter tools with `toolsAllow` and `toolsDeny` to reduce token overhead and keep the agent focused.
+
+### How It Works
+
+- **`toolsAllow`** — allowlist. If set, only these tools are registered. Tool names are specified **without** the `toolsPrefix`.
+- **`toolsDeny`** — denylist. Applied **after** `toolsAllow`. Removes matching tools from the final set.
+- You can use either field alone, or both together.
+
+### Filtering on MCPServer CRD
+
+Set `toolsAllow`/`toolsDeny` on the MCPServer spec to define cluster-wide defaults for that server:
+
+```yaml
+apiVersion: sympozium.ai/v1alpha1
+kind: MCPServer
+metadata:
+  name: k8s-networking-mcp
+  namespace: sympozium-system
+spec:
+  transportType: http
+  toolsPrefix: k8s_net
+  toolsAllow:
+    - get_pods
+    - get_services
+    - get_endpoints
+    - get_ingresses
+    - get_network_policies
+    - describe_pod
+    - describe_service
+    - get_pod_logs
+    - check_connectivity
+    - get_gateway_routes
+    - get_virtual_services
+    - diagnose_service
+  deployment:
+    image: ghcr.io/henrikrexed/k8s-networking-mcp:latest
+    port: 8080
+    serviceAccountName: k8s-networking-mcp
+```
+
+This reduces the exposed tools from 42 to 12, saving ~9K tokens per agent run.
+
+### Filtering on MCPServerRef (Per-Instance)
+
+You can also set `toolsAllow`/`toolsDeny` on individual `mcpServers` entries in a `SympoziumInstance`. This lets different agents use different subsets of the same MCP server:
+
+```yaml
+apiVersion: sympozium.ai/v1alpha1
+kind: SympoziumInstance
+metadata:
+  name: network-triage-agent
+spec:
+  mcpServers:
+    - name: k8s-networking-mcp
+      toolsAllow:
+        - get_pods
+        - get_services
+        - describe_pod
+        - get_pod_logs
+        - diagnose_service
+    - name: dynatrace-mcp
+      toolsDeny:
+        - delete_dashboard
+        - update_settings
+```
+
+### Inheritance Behavior
+
+If an `MCPServerRef` in your `SympoziumInstance` does **not** set `toolsAllow` or `toolsDeny`, the values from the `MCPServer` CRD spec are inherited automatically. If the ref sets its own values, they take precedence (no merging — the ref's list fully replaces the CRD default).
+
+| MCPServer CRD | MCPServerRef | Result |
+|---------------|-------------|--------|
+| `toolsAllow: [a, b, c]` | _(not set)_ | `[a, b, c]` inherited |
+| `toolsAllow: [a, b, c]` | `toolsAllow: [a, b]` | `[a, b]` (ref wins) |
+| _(not set)_ | `toolsAllow: [a, b]` | `[a, b]` |
+| _(not set)_ | _(not set)_ | All tools exposed |
+
+The same logic applies to `toolsDeny`.
+
 ## Connecting Agents to MCP Servers
 
 In your `SympoziumInstance`, reference MCP servers by name:
@@ -193,6 +274,8 @@ Shows:
 | `url` | string | No | - | URL for external servers (no deployment) |
 | `toolsPrefix` | string | Yes | - | Prefix for tool names (e.g., `dt`, `k8s_net`) |
 | `timeout` | int | No | 30 | Per-request timeout in seconds |
+| `toolsAllow` | []string | No | - | Tool names (without prefix) to expose. If set, only these are registered |
+| `toolsDeny` | []string | No | - | Tool names (without prefix) to hide. Applied after `toolsAllow` |
 | `replicas` | int | No | 1 | Number of replicas |
 | `deployment` | object | No | - | Deployment spec (see below) |
 
