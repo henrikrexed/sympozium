@@ -135,6 +135,9 @@ func (s *Server) buildMux(frontendFS fs.FS, token string) http.Handler {
 	mux.HandleFunc("DELETE /api/v1/gateway", s.deleteGatewayConfig)
 	mux.HandleFunc("GET /api/v1/gateway/metrics", s.getGatewayMetrics)
 
+	// Cluster info
+	mux.HandleFunc("GET /api/v1/cluster", s.getClusterInfo)
+
 	// Namespace listing
 	mux.HandleFunc("GET /api/v1/namespaces", s.listNamespaces)
 	mux.HandleFunc("GET /api/v1/pods", s.listPods)
@@ -1998,6 +2001,45 @@ func (s *Server) getGatewayMetrics(w http.ResponseWriter, r *http.Request) {
 					resp.UptimeSec = uptime
 				}
 			}
+		}
+	}
+
+	writeJSON(w, resp)
+}
+
+// ClusterInfoResponse is the response for GET /api/v1/cluster.
+type ClusterInfoResponse struct {
+	Nodes      int    `json:"nodes"`
+	Namespaces int    `json:"namespaces"`
+	Pods       int    `json:"pods"`
+	Version    string `json:"version,omitempty"`
+}
+
+func (s *Server) getClusterInfo(w http.ResponseWriter, r *http.Request) {
+	var resp ClusterInfoResponse
+
+	// Count nodes
+	var nodeList corev1.NodeList
+	if err := s.client.List(r.Context(), &nodeList); err == nil {
+		resp.Nodes = len(nodeList.Items)
+	}
+
+	// Count all namespaces
+	var nsList corev1.NamespaceList
+	if err := s.client.List(r.Context(), &nsList); err == nil {
+		resp.Namespaces = len(nsList.Items)
+	}
+
+	// Count all pods cluster-wide
+	var podList corev1.PodList
+	if err := s.client.List(r.Context(), &podList); err == nil {
+		resp.Pods = len(podList.Items)
+	}
+
+	// Get cluster version
+	if s.kube != nil {
+		if info, err := s.kube.Discovery().ServerVersion(); err == nil {
+			resp.Version = info.GitVersion
 		}
 	}
 

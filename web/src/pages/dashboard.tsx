@@ -15,7 +15,7 @@ import {
   TableBody,
   TableCell,
 } from "@/components/ui/table";
-import { useInstances, useRuns, usePolicies, useSkills, useSchedules, usePersonaPacks } from "@/hooks/use-api";
+import { useInstances, useRuns, usePolicies, useSkills, useSchedules, usePersonaPacks, useClusterInfo } from "@/hooks/use-api";
 import { useWebSocket } from "@/hooks/use-websocket";
 import { formatAge, truncate } from "@/lib/utils";
 import { Link } from "react-router-dom";
@@ -27,6 +27,10 @@ import {
   Clock,
   Users,
   Activity,
+  HardDrive,
+  Box,
+  Layers,
+  Gauge,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
@@ -256,6 +260,7 @@ export function DashboardPage() {
   const skills = useSkills();
   const schedules = useSchedules();
   const personaPacks = usePersonaPacks();
+  const clusterInfo = useClusterInfo();
   const { events, connected } = useWebSocket();
   const [range, setRange] = useState<RangeKey>("24h");
   const [durationMode, setDurationMode] = useState<DurationMode>("avg");
@@ -295,47 +300,53 @@ export function DashboardPage() {
     return percentile(all, 95);
   }, [activity]);
 
+  const totalPods = clusterInfo.data?.pods ?? 0;
+  const totalAgentPods = (instances.data || []).reduce(
+    (sum, inst) => sum + (inst.status?.activeAgentPods ?? 0),
+    0,
+  );
+
   const stats = [
+    {
+      label: "Nodes",
+      value: clusterInfo.data?.nodes ?? "—",
+      icon: HardDrive,
+      to: "/instances",
+      color: "text-blue-400",
+    },
+    {
+      label: "Pods",
+      value: clusterInfo.data?.pods ?? "—",
+      icon: Box,
+      to: "/instances",
+      color: "text-emerald-400",
+    },
+    {
+      label: "Agent Pods",
+      value: totalAgentPods,
+      icon: Play,
+      to: "/instances",
+      color: "text-cyan-400",
+    },
+    {
+      label: "Namespaces",
+      value: clusterInfo.data?.namespaces ?? "—",
+      icon: Layers,
+      to: "/instances",
+      color: "text-orange-400",
+    },
+    {
+      label: "Active Runs",
+      value: activeRuns.length,
+      icon: Gauge,
+      to: "/runs",
+      color: "text-violet-400",
+    },
     {
       label: "Instances",
       value: instances.data?.length ?? "—",
       icon: Server,
       to: "/instances",
-      color: "text-blue-400",
-    },
-    {
-      label: "Active Runs",
-      value: activeRuns.length,
-      icon: Play,
-      to: "/runs",
-      color: "text-emerald-400",
-    },
-    {
-      label: "Policies",
-      value: policies.data?.length ?? "—",
-      icon: Shield,
-      to: "/policies",
-      color: "text-cyan-400",
-    },
-    {
-      label: "Skills",
-      value: skills.data?.length ?? "—",
-      icon: Wrench,
-      to: "/skills",
-      color: "text-orange-400",
-    },
-    {
-      label: "Schedules",
-      value: schedules.data?.length ?? "—",
-      icon: Clock,
-      to: "/schedules",
-      color: "text-violet-400",
-    },
-    {
-      label: "Persona Packs",
-      value: personaPacks.data?.length ?? "—",
-      icon: Users,
-      to: "/personas",
       color: "text-purple-400",
     },
   ];
@@ -381,20 +392,16 @@ export function DashboardPage() {
           <div className="h-8 w-px bg-border/60 shrink-0" />
           <div className="flex flex-1 items-center justify-around gap-4">
             <div className="text-center">
-              <div className="text-xs text-muted-foreground">Instances</div>
-              <div className="text-lg font-semibold text-foreground">{instances.data?.length ?? "—"}</div>
+              <div className="text-xs text-muted-foreground">Nodes</div>
+              <div className="text-lg font-semibold text-foreground">{clusterInfo.data?.nodes ?? "—"}</div>
             </div>
             <div className="text-center">
-              <div className="text-xs text-muted-foreground">Active Runs</div>
-              <div className="text-lg font-semibold text-foreground">{activeRuns.length}</div>
+              <div className="text-xs text-muted-foreground">Pods</div>
+              <div className="text-lg font-semibold text-foreground">{clusterInfo.data?.pods ?? "—"}</div>
             </div>
             <div className="text-center">
-              <div className="text-xs text-muted-foreground">Skills</div>
-              <div className="text-lg font-semibold text-foreground">{skills.data?.length ?? "—"}</div>
-            </div>
-            <div className="text-center">
-              <div className="text-xs text-muted-foreground">Policies</div>
-              <div className="text-lg font-semibold text-foreground">{policies.data?.length ?? "—"}</div>
+              <div className="text-xs text-muted-foreground">Namespaces</div>
+              <div className="text-lg font-semibold text-foreground">{clusterInfo.data?.namespaces ?? "—"}</div>
             </div>
             <div className="text-center">
               <div className="text-xs text-muted-foreground">Failure Rate</div>
@@ -408,6 +415,12 @@ export function DashboardPage() {
                 {avgDurationSecInRange > 0 ? `${avgDurationSecInRange.toFixed(1)}s` : "—"}
               </div>
             </div>
+            {clusterInfo.data?.version && (
+              <div className="text-center">
+                <div className="text-xs text-muted-foreground">K8s Version</div>
+                <div className="text-lg font-semibold text-foreground">{clusterInfo.data.version}</div>
+              </div>
+            )}
           </div>
         </div>
       </div>

@@ -440,6 +440,15 @@ export interface PodInfo {
   instanceRef?: string;
 }
 
+// ── Cluster Info ─────────────────────────────────────────────────────────
+
+export interface ClusterInfoResponse {
+  nodes: number;
+  namespaces: number;
+  pods: number;
+  version?: string;
+}
+
 // ── API client ───────────────────────────────────────────────────────────────
 
 /** Typed error so callers can inspect the HTTP status code. */
@@ -659,6 +668,10 @@ export const api = {
 
   namespaces: {
     list: () => apiFetch<string[]>("/api/v1/namespaces"),
+  },
+
+  cluster: {
+    info: () => apiFetch<ClusterInfoResponse>("/api/v1/cluster"),
   },
 
   observability: {

@@ -251,6 +251,16 @@ export function useInstallDefaultPersonaPacks() {
   });
 }
 
+// ── Cluster Info ─────────────────────────────────────────────────────────────
+
+export function useClusterInfo() {
+  return useQuery({
+    queryKey: ["cluster", "info"],
+    queryFn: api.cluster.info,
+    refetchInterval: 15000,
+  });
+}
+
 // ── Pods ─────────────────────────────────────────────────────────────────────
 
 export function usePods() {
