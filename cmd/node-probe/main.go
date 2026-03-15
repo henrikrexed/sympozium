@@ -321,7 +321,7 @@ func buildAnnotations(results []ProbeResult) map[string]interface{} {
 				annotations[modelsKey] = nil // remove if no models
 			}
 		} else {
-			annotations[portKey] = nil  // remove annotation
+			annotations[portKey] = nil   // remove annotation
 			annotations[modelsKey] = nil // remove annotation
 		}
 	}
