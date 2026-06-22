@@ -1,0 +1,18 @@
+# StorageClass backed by csi-driver-nfs for the Sympozium workload cluster.
+# Rendered by deployment.sh via envsubst (fills ${NFS_SERVER} and ${NFS_SHARE}).
+#   NFS_SERVER=10.0.0.10
+#   NFS_SHARE=/export/sympozium
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-csi
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: nfs.csi.k8s.io
+parameters:
+  server: ${NFS_SERVER}
+  share: ${NFS_SHARE}
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+mountOptions:
+  - nfsvers=4.1

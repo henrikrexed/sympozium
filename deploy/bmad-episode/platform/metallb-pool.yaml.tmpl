@@ -1,0 +1,21 @@
+# MetalLB address pool + L2 advertisement for the Sympozium workload cluster.
+# Rendered by deployment.sh via envsubst (fills ${METALLB_IP_RANGE}).
+# The range must be a block of free IPs on the cluster's LAN segment, e.g.
+#   METALLB_IP_RANGE=10.0.0.240-10.0.0.250
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: sympozium-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - ${METALLB_IP_RANGE}
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: sympozium-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - sympozium-pool

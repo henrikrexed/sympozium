@@ -1,0 +1,170 @@
+---
+# Sympozium SkillPack: BMAD Method
+#
+# Brings the BMAD (Breakthrough Method for Agile AI-Driven Development) workflow
+# into the agent pod as a set of Markdown skill instructions. Personas that mount
+# this pack learn the BMAD phases (Analysis → PRD → Architecture → Stories →
+# Implementation → Review) and the structured handoff format used to pass work
+# between agents in an Ensemble.
+#
+# Mount it on any persona via:
+#   spec.personas[].skills: [bmad, ...]
+#
+# Apply with:  kubectl apply -f config/skills/bmad.yaml
+apiVersion: sympozium.ai/v1alpha1
+kind: SkillPack
+metadata:
+  name: bmad
+  namespace: sympozium-system
+  labels:
+    sympozium.ai/builtin: "false"
+    sympozium.ai/category: development
+spec:
+  category: development
+  version: "0.1.0"
+  source: custom
+  skills:
+    - name: bmad-method
+      description: The BMAD agile AI-driven development workflow and its phases
+      content: |
+        # BMAD Method
+
+        BMAD (Breakthrough Method for Agile AI-Driven Development) structures
+        multi-agent software work into explicit phases. Each phase produces a
+        durable artifact that the next phase consumes. Never skip ahead: a phase
+        is only "done" when its artifact exists and is referenced by name.
+
+        ## Phases
+        | # | Phase | Owner role | Artifact produced |
+        |---|-------|-----------|-------------------|
+        | 1 | Analysis | tech-lead | Problem statement, scope, constraints |
+        | 2 | PRD | tech-lead | Product Requirements Document |
+        | 3 | Architecture / Solutioning | tech-lead | Solution design decisions |
+        | 4 | Epics & Stories | tech-lead | Backlog of epics + acceptance-criteria'd stories |
+        | 5 | Implementation | coding | Code change + tests, opened as a PR |
+        | 6 | Review | code-review | Adversarial review verdict on the PR |
+
+        ## Operating rules
+        - **Artifacts are contracts.** Reference them by exact name in every handoff.
+        - **One story at a time.** A coding agent picks the single highest-priority
+          ready story, implements it, writes tests, and opens ONE PR.
+        - **Acceptance criteria are binding.** A story is not done until every
+          checkbox in its acceptance criteria is satisfied and proven.
+        - **Stop at the phase boundary.** Do not implement during PRD; do not
+          merge during review. Hand off instead (see the handoff skill).
+
+    - name: create-prd
+      description: How to write a BMAD Product Requirements Document
+      content: |
+        # BMAD PRD Format
+
+        Produce a PRD before any code is written. Keep it tight and testable.
+
+        ```
+        # PRD: <feature name>
+        ## Problem
+        <one paragraph: who is blocked and why>
+        ## Goals (measurable)
+        - G1: ...
+        ## Non-goals
+        - ...
+        ## Functional requirements
+        - FR1: The system MUST ...
+        ## Acceptance criteria (binding)
+        - [ ] AC1: ...
+        ## Risks & open questions
+        - ...
+        ```
+
+        Rules:
+        - Every functional requirement maps to at least one acceptance criterion.
+        - No requirement without a way to verify it.
+        - Defer anything not needed for the MVP to "Non-goals".
+
+    - name: create-epics-and-stories
+      description: Break a PRD into epics and implementation-ready stories
+      content: |
+        # BMAD Epics & Stories
+
+        Decompose the PRD into epics, then epics into stories sized for a single
+        agent run.
+
+        ```
+        ## Epic: <name>  (maps to PRD goals: G1, G2)
+        ### Story: <imperative title>
+        As a <role>, I want <capability> so that <benefit>.
+        Acceptance criteria:
+        - [ ] AC1 ...
+        - [ ] AC2 ...
+        Dependencies: <story ids or "none">
+        Estimate: S | M | L
+        ```
+
+        Sizing rule: a story must be completable — code + tests + PR — in one
+        run. If it cannot, split it. Mark cross-story dependencies explicitly so
+        the Ensemble can parallelise safely.
+
+    - name: adversarial-code-review
+      description: BMAD adversarial review layers applied to a PR
+      content: |
+        # BMAD Adversarial Code Review
+
+        Review a PR through three independent adversarial lenses. Report findings
+        triaged by severity; do NOT approve until Critical/Major are resolved.
+
+        ## Layers
+        1. **Blind Hunter** — read the diff with no charity; assume it is wrong.
+           Find the bug the author did not see.
+        2. **Edge Case Hunter** — enumerate boundary inputs (empty, nil, max,
+           concurrent, unicode, timezone) and check each is handled.
+        3. **Acceptance Auditor** — open the story's acceptance criteria and prove
+           each checkbox is actually satisfied by the diff + tests. Reject if any
+           criterion is unproven.
+
+        ## Verdict format
+        ```
+        ## Review verdict: <APPROVE | REQUEST_CHANGES>
+        ### Critical 🔴 (must fix)
+        - file:line — finding — why — suggested fix
+        ### Major 🟠 (should fix)
+        ### Minor 🟡 / Suggestion 🟢
+        ### Acceptance criteria audit
+        - [x] AC1 proven by <test/file>
+        - [ ] AC2 NOT proven — <gap>
+        ```
+        Approve only when all acceptance criteria are checked and no Critical/Major
+        findings remain.
+
+    - name: agent-handoff
+      description: Structured handoff format for passing work between Ensemble agents
+      content: |
+        # BMAD Agent Handoff
+
+        Agents in an Ensemble collaborate asynchronously. They do NOT call each
+        other directly — they hand off through durable artifacts (GitHub
+        issues/PRs), shared memory (MEMORY.md), and Slack notifications. Use this
+        structured block at the end of any run that passes work onward.
+
+        ```
+        ## HANDOFF
+        from: <your persona>            # e.g. coding
+        to: <target persona | role>     # e.g. code-review
+        phase: <next BMAD phase>        # e.g. Review
+        artifact: <PR #, issue #, or doc name>
+        summary: <2-3 lines of what you did and what is left>
+        next-action: <the single concrete thing the receiver should do>
+        blockers: <none | description + who unblocks>
+        ```
+
+        Persistence:
+        - Post the handoff as a PR/issue comment via the github-gitops skill so it
+          is durable and visible to the whole Ensemble.
+        - Mirror a one-line summary to Slack so a human can follow the flow live.
+        - Record any decision worth remembering across runs in MEMORY.md.
+      requires:
+        tools:
+          - read_file
+          - grep_search
+  runtimeRequirements:
+    minMemory: 256Mi
+    minCPU: 100m

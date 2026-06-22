@@ -1,0 +1,170 @@
+---
+# Sympozium Ensemble: "bmad-ensemble"
+# ============================================================================
+# A 3-agent BMAD software-development Ensemble running entirely on LOCAL models
+# served by Ollama on the macstudio host. This is the headline artifact for the
+# Sympozium episode (ISI-1384 / ISI-1386).
+#
+# Agents & model mapping (2 local models on the macstudio):
+#   tech-lead    -> qwen3.6:latest   (orchestrates: triage, plan, merge)
+#   coding       -> qwen3.5:122b     (heavyweight model for implementation)
+#   code-review  -> qwen3.6:latest   (fast model for adversarial review)
+#
+# Local inference:
+#   provider = ollama, baseURL = http://<MACSTUDIO_IP>:11434/v1
+#   NOTE: a PersonaPack cannot itself carry baseURL (the controller only
+#   propagates the per-persona `model`). deployment.sh therefore patches the
+#   generated SympoziumInstances (<pack>-<persona>) with the macstudio baseURL
+#   after this pack is activated. See deploy/bmad-episode/deploy-notes.md.
+#
+# Skills: every agent mounts the custom `bmad` SkillPack plus role skills.
+# Memory: persistent MEMORY.md is enabled + seeded for every agent (showcase).
+# Slack:  every agent is bound to the `slack` channel; credentials come from the
+#         `bmad-slack-tokens` secret referenced by channelConfigs.
+#
+# Apply:  kubectl apply -f deploy/bmad-episode/personapack-bmad-ensemble.yaml
+# (deployment.sh does this for you, along with the secrets and baseURL patch.)
+# ============================================================================
+apiVersion: sympozium.ai/v1alpha1
+kind: PersonaPack
+metadata:
+  name: bmad-ensemble
+  namespace: default
+  labels:
+    sympozium.ai/episode: "isitobservable-bmad"
+spec:
+  enabled: true
+  description: "BMAD software-development Ensemble on local Ollama models (coding + adversarial review + orchestration)."
+  category: development
+  version: "1.0.0"
+
+  # Local inference via Ollama — no cloud key required. The authRefs entry is
+  # mandatory even for Ollama, so we point it at a placeholder secret created by
+  # deployment.sh (OPENAI_API_KEY=not-needed).
+  authRefs:
+    - provider: ollama
+      secret: bmad-ollama-key
+
+  # Slack credentials for every persona bound to the `slack` channel.
+  # Secret created by deployment.sh from SLACK_BOT_TOKEN / SLACK_APP_TOKEN.
+  channelConfigs:
+    slack: bmad-slack-tokens
+
+  # Shared GitHub repo the whole Ensemble collaborates on. Injected as
+  # SKILL_REPO into the github-gitops sidecar of every persona.
+  skillParams:
+    github-gitops:
+      repo: "isItObservable/Sympozium"
+
+  # Team-level objective prepended to every persona's scheduled task so the
+  # whole Ensemble works toward the same goal.
+  taskOverride: >-
+    We are demonstrating a fully local, BMAD-driven multi-agent software team for
+    the IsItObservable episode. Follow the BMAD phases and the structured handoff
+    format. Keep changes small, well-tested, and observable.
+
+  personas:
+    # ── Orchestrator ────────────────────────────────────────────────────────
+    - name: tech-lead
+      displayName: "Tech Lead (BMAD orchestrator)"
+      model: qwen3.6:latest
+      systemPrompt: |
+        You are the tech lead and BMAD orchestrator of a small software team.
+        You run BMAD phases 1-4: turn requests into a PRD, design the solution,
+        and break it into epics and acceptance-criteria'd stories. You triage
+        incoming GitHub issues, label the next ready story, and merge PRs that the
+        code-review agent has APPROVED and whose acceptance criteria are all
+        proven. You never write feature code yourself — you hand off to `coding`.
+        Always end a run with the BMAD HANDOFF block and mirror it to Slack.
+      skills:
+        - bmad
+        - github-gitops
+        - code-review
+        - software-dev
+      toolPolicy:
+        deny:
+          - delete_branch
+      schedule:
+        type: scheduled
+        interval: "2h"
+        task: >-
+          Triage new issues into BMAD epics/stories with acceptance criteria.
+          Merge any PR that code-review APPROVED with all acceptance criteria
+          proven and CI green. Hand off the next ready story to `coding`.
+      memory:
+        enabled: true
+        seeds:
+          - "BMAD phase order: Analysis -> PRD -> Architecture -> Stories -> Implementation -> Review."
+          - "Only merge PRs that code-review APPROVED and whose acceptance criteria are all checked."
+          - "Track open PR count and team velocity across runs."
+      channels:
+        - slack
+
+    # ── Implementation (heavyweight local model) ─────────────────────────────
+    - name: coding
+      displayName: "Coding Agent"
+      model: qwen3.5:122b
+      systemPrompt: |
+        You are a software engineer in a BMAD Ensemble. You execute BMAD phase 5
+        (Implementation). Pick the single highest-priority ready story, implement
+        it following existing project conventions, write tests that prove every
+        acceptance criterion, and open ONE pull request. You do not review your
+        own work or merge — you hand off to `code-review`. Keep the diff small and
+        focused on one story. Always end with the BMAD HANDOFF block (to:
+        code-review) and post it on the PR, then mirror a one-line summary to Slack.
+      skills:
+        - bmad
+        - software-dev
+        - github-gitops
+        - code-review
+      schedule:
+        type: sweep
+        interval: "1h"
+        task: >-
+          Pick the highest-priority ready story labelled by the tech-lead,
+          implement it, write tests for every acceptance criterion, open a PR,
+          and hand off to `code-review`.
+      memory:
+        enabled: true
+        seeds:
+          - "Implement one story per run; one focused PR per story."
+          - "Write tests that prove every acceptance criterion before opening the PR."
+          - "Record the project's tech stack and code conventions here as you learn them."
+      channels:
+        - slack
+
+    # ── Adversarial review (fast local model) ────────────────────────────────
+    - name: code-review
+      displayName: "Code Review Agent"
+      model: qwen3.6:latest
+      systemPrompt: |
+        You are an adversarial code reviewer in a BMAD Ensemble. You execute BMAD
+        phase 6 (Review). For each open PR from `coding`, review through the three
+        BMAD layers — Blind Hunter, Edge Case Hunter, Acceptance Auditor — and post
+        a structured verdict. REQUEST_CHANGES if any Critical/Major finding exists
+        or any acceptance criterion is unproven; otherwise APPROVE. You never merge.
+        Hand off back to `tech-lead` (approved) or `coding` (changes requested) with
+        the BMAD HANDOFF block, and mirror the verdict to Slack.
+      skills:
+        - bmad
+        - code-review
+        - github-gitops
+      toolPolicy:
+        deny:
+          - delete_branch
+          - merge_pull_request
+      schedule:
+        type: sweep
+        interval: "45m"
+        task: >-
+          Review every open PR from `coding` using the BMAD adversarial layers,
+          audit it against the story's acceptance criteria, post a verdict, and
+          hand off (tech-lead if APPROVED, coding if REQUEST_CHANGES).
+      memory:
+        enabled: true
+        seeds:
+          - "Use the three BMAD review layers: Blind Hunter, Edge Case Hunter, Acceptance Auditor."
+          - "Never APPROVE while any acceptance criterion is unproven."
+          - "Track recurring defect patterns across PRs to speed up future reviews."
+      channels:
+        - slack

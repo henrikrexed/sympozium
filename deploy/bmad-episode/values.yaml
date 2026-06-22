@@ -1,0 +1,82 @@
+# Helm values for the IsItObservable Sympozium episode (ISI-1386).
+# Used by deployment.sh:
+#   helm upgrade --install sympozium ./charts/sympozium \
+#     -n sympozium-system --create-namespace \
+#     -f deploy/bmad-episode/values.yaml
+#
+# Goal: stand up the Sympozium control plane ready for the bmad-ensemble running
+# on local Ollama models, with agent telemetry exported via OpenTelemetry.
+
+# Pull control-plane images from the maintained fork registry (matches the
+# Helm OCI publish workflow on this repo). Override `image.tag` to pin a release.
+image:
+  registry: ghcr.io/henrikrexed/sympozium
+  pullPolicy: IfNotPresent
+  tag: ""            # defaults to chart appVersion
+
+namespace: sympozium-system
+
+# Built-in SkillPacks (code-review, github-gitops, software-dev, k8s-ops, ...).
+# The custom `bmad` SkillPack is applied separately by deployment.sh.
+defaultSkills:
+  enabled: true
+
+# Install the built-in PersonaPack catalog (disabled until activated). Our
+# bmad-ensemble pack is applied separately and activated (enabled: true).
+defaultPersonas:
+  enabled: true
+
+# cert-manager must be present (deployment.sh installs it). Self-signed issuer
+# is fine for a tutorial cluster.
+certManager:
+  enabled: true
+  issuer:
+    kind: Issuer
+    name: sympozium-selfsigned
+    selfSigned: true
+
+# NATS JetStream event bus, persisted on the NFS StorageClass provisioned by
+# deployment.sh so agent IPC survives a controller restart during the demo.
+nats:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: nfs-csi
+
+# Node-probe DaemonSet. The macstudio is an EXTERNAL host (not a cluster node),
+# so it is reached by explicit baseURL rather than node discovery. We still
+# enable the probe so the episode can show in-cluster discovery if desired.
+nodeProbe:
+  enabled: true
+
+# Network policies for agent isolation. Egress to Ollama's port 11434 is already
+# allowed by the defaults, so local-model traffic to the macstudio works.
+networkPolicies:
+  enabled: true
+  extraEgressPorts: []
+
+# OpenTelemetry — export agent + control-plane telemetry. The built-in collector
+# is enabled and instances get observability on by default. Point the collector
+# at your backend (e.g. Dynatrace) by editing the otel-collector exporter, or
+# set observability.endpoint to an external OTLP endpoint.
+observability:
+  enabled: true
+  samplingRatio: 1.0
+  serviceNamePrefix: "sympozium"
+  resourceAttributes:
+    deployment.environment: "isitobservable-episode"
+    k8s.cluster.name: "sympozium-workload"
+  defaultInstance:
+    enabled: true
+    otlpEndpoint: "sympozium-otel-collector.sympozium-system.svc:4317"
+    otlpProtocol: "grpc"
+    serviceName: "sympozium-agent-runner"
+    resourceAttributes:
+      deployment.environment: "isitobservable-episode"
+
+# Envoy/kgateway-fronted web endpoints are optional for this episode. Enable and
+# set a baseDomain if you want per-agent web endpoints behind the gateway.
+gateway:
+  enabled: false
+  baseDomain: ""
