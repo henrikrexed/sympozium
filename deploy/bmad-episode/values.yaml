@@ -7,12 +7,15 @@
 # Goal: stand up the Sympozium control plane ready for the bmad-ensemble running
 # on local Ollama models, with agent telemetry exported via OpenTelemetry.
 
-# Pull control-plane images from the maintained fork registry (matches the
-# Helm OCI publish workflow on this repo). Override `image.tag` to pin a release.
+# Control-plane container images. The maintained fork (henrikrexed) publishes the
+# Helm CHART to its GHCR, but NOT the controller/apiserver/webhook IMAGES — those
+# live in the upstream registry (verified: ghcr.io/alexsjones/sympozium/*:v0.2.0
+# return 200, while the fork paths 404). So we pull images from upstream and keep
+# using the fork's chart. Override `image.tag` to pin a release.
 image:
-  registry: ghcr.io/henrikrexed/sympozium
+  registry: ghcr.io/alexsjones/sympozium
   pullPolicy: IfNotPresent
-  tag: ""            # defaults to chart appVersion
+  tag: ""            # defaults to chart appVersion (v0.2.0)
 
 namespace: sympozium-system
 
@@ -37,12 +40,16 @@ certManager:
 
 # NATS JetStream event bus, persisted on the NFS StorageClass provisioned by
 # deployment.sh so agent IPC survives a controller restart during the demo.
+# NOTE: the rebuilt workload cluster (ISI-1385) ships csi-driver-nfs with the
+# default StorageClass named `truenas-nfs-csi` (TrueNAS-backed), so we target it
+# directly. With `--skip-platform` the episode's own `nfs-csi` SC is not created;
+# this keeps the NATS PVC bindable against the platform ProxOps actually provisioned.
 nats:
   enabled: true
   persistence:
     enabled: true
     size: 1Gi
-    storageClass: nfs-csi
+    storageClass: truenas-nfs-csi
 
 # Node-probe DaemonSet. The macstudio is an EXTERNAL host (not a cluster node),
 # so it is reached by explicit baseURL rather than node discovery. We still

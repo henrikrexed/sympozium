@@ -1,3 +1,11 @@
+{{- /*
+  By default the release namespace is provisioned by `helm --create-namespace`
+  (see deployment.sh), so templating a Namespace here collides with the
+  helm-created one ("namespaces ... already exists"). Render it only when the
+  caller explicitly opts in with `--set createNamespaceResource=true` and is
+  NOT relying on --create-namespace.
+*/ -}}
+{{- if .Values.createNamespaceResource }}
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -5,3 +13,4 @@ metadata:
   labels:
     {{- include "sympozium.labels" . | nindent 4 }}
     control-plane: controller-manager
+{{- end }}

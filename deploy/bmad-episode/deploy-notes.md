@@ -5,6 +5,33 @@ of the Sympozium episode (ISI-1384). Owner of this config: Observability Agent
 (ISI-1386). Cluster bring-up (CNI/MetalLB/csi-driver-nfs) is the sibling ProxOps
 issue **ISI-1385** — `deployment.sh` runs *after* that cluster is reachable.
 
+> **Live-validated on 2026-06-23** against the rebuilt `observable-llm` workload
+> cluster (ISI-1385). The control plane, `bmad` SkillPack, `bmad-ensemble`
+> PersonaPack (3 Running instances), per-agent memory ConfigMaps, and Slack
+> secret all deploy cleanly with `./deployment.sh --skip-platform`. Three fixes
+> landed during that run (see **Gotchas** below). Still external at validation
+> time: (1) the macstudio must actually serve Ollama with the two qwen models for
+> live inference; (2) real Slack tokens are needed to move the channel from
+> `Disconnected` to connected.
+
+### Gotchas found during the live deploy (already fixed in this repo)
+
+- **`--skip-platform` skips cert-manager too.** cert-manager is installed inside
+  the platform step, but the Sympozium chart's admission webhook needs it
+  (`certManager.enabled: true`). On a ProxOps-provisioned cluster that lacks
+  cert-manager, install it first:
+  `kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml`
+  then `kubectl -n cert-manager rollout status deploy/cert-manager-webhook`.
+- **StorageClass name.** The rebuilt cluster's default SC is `truenas-nfs-csi`
+  (not the episode's `nfs-csi`, which is only created when you run *with* the
+  platform step). `values.yaml` now targets `truenas-nfs-csi` so the NATS PVC binds.
+- **Image registry.** The fork (`ghcr.io/henrikrexed/sympozium`) publishes the
+  Helm *chart* but not the control-plane *images*. Those live upstream
+  (`ghcr.io/alexsjones/sympozium/{controller,apiserver,webhook}:v0.2.0`), which
+  `values.yaml` now points at.
+- **Chart namespace template.** `templates/namespace.yaml` is now gated behind
+  `createNamespaceResource` so it no longer collides with `helm --create-namespace`.
+
 ## What gets deployed
 
 | Layer | Component | How |
@@ -20,16 +47,29 @@ issue **ISI-1385** — `deployment.sh` runs *after* that cluster is reachable.
 ## One-shot deploy
 
 ```bash
-export MACSTUDIO_IP=10.0.0.50              # Mac Studio running Ollama (REQUIRED)
+export KUBECONFIG=/path/to/observable-llm.kubeconfig   # the rebuilt workload cluster
+export MACSTUDIO_IP=<mac-studio-ip>        # Mac Studio running Ollama (REQUIRED) — CONFIRM with the board
 export METALLB_IP_RANGE=10.0.0.240-10.0.0.250
 export NFS_SERVER=10.0.0.10
 export NFS_SHARE=/export/sympozium
 export SLACK_BOT_TOKEN=xoxb-...            # optional but needed for Slack
 export SLACK_APP_TOKEN=xapp-...            # optional (Socket Mode)
 
-./deployment.sh                            # full stack
-# ./deployment.sh --skip-platform          # if ProxOps already provisioned the cluster pieces
+./deployment.sh                            # full stack (greenfield cluster)
 # ./deployment.sh --with-kgateway          # also install kgateway
+```
+
+**On a ProxOps-provisioned cluster (the normal episode path):** MetalLB,
+csi-driver-nfs, and kgateway are already installed, so run with `--skip-platform`
+— but install cert-manager first (see Gotchas above). Only `MACSTUDIO_IP` (and
+the Slack tokens, if demoing Slack) are required in that mode:
+
+```bash
+export KUBECONFIG=/path/to/observable-llm.kubeconfig
+export MACSTUDIO_IP=<mac-studio-ip>        # CONFIRM with the board; 10.0.0.185 (old) now overlaps the MetalLB pool
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml
+kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s
+./deployment.sh --skip-platform
 ```
 
 ## The Ensemble (agents, models, flow)
