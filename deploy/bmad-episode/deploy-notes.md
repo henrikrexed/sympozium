@@ -74,6 +74,19 @@ kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180
 
 ## The Ensemble (agents, models, flow)
 
+> **Superseded — see `ensemble-bmad-crew.yaml`.** The live `observable-llm`
+> deploy runs the **10-agent** v2.0.0 Ensemble (ISI-1394 migration), not the
+> 3-agent design described below. The canonical manifest is
+> `ensemble-bmad-crew.yaml` in this directory.
+>
+> **Models (ISI-1396):** all 10 agents now run on **`qwen3.6:latest`**. The
+> heavyweight `qwen3.5:122b` was dropped from architect / code-reviewer /
+> testing-architect / devops-engineer: on the Mac Studio its warm single-call
+> latency (~428s) exceeds the agent-runner's hardcoded ~5-min per-request
+> deadline, and its 81 GB footprint evicts/cold-reloads the lighter model,
+> causing `context deadline exceeded` + `timeout` AgentRun failures. See the
+> header of `ensemble-bmad-crew.yaml` for the full measurement + rationale.
+
 Three agents collaborating via the **BMAD** workflow. Handoff is asynchronous —
 agents never call each other; they pass work through GitHub PRs/issues, shared
 `MEMORY.md`, and Slack messages.
