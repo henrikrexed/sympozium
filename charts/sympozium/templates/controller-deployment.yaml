@@ -34,6 +34,13 @@ spec:
           env:
             - name: SYMPOZIUM_IMAGE_REGISTRY
               value: {{ .Values.image.registry }}
+            # Tag the controller stamps on runtime-spawned pods (agent-runner,
+            # memory-server, MCP servers, channel sidecars). Mirrors the tag the
+            # controller image itself resolves to so sidecars are pinned to an
+            # existing tag — never :latest — and survive an instance re-create
+            # (ISI-1417). main.go reads this via os.Getenv("SYMPOZIUM_IMAGE_TAG").
+            - name: SYMPOZIUM_IMAGE_TAG
+              value: {{ include "sympozium.imageTag" . | quote }}
             - name: NATS_URL
               value: {{ include "sympozium.natsUrl" . }}
             - name: POD_NAME
