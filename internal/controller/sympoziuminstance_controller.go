@@ -165,6 +165,20 @@ func (r *SympoziumInstanceReconciler) reconcileChannels(ctx context.Context, ins
 	return nil
 }
 
+// DisplayNameAnnotation carries the agent's human-readable name onto the
+// SympoziumInstance so channel pods can attribute outbound messages to the
+// right persona. Set by the PersonaPack reconciler from PersonaSpec.DisplayName.
+const DisplayNameAnnotation = "sympozium.ai/display-name"
+
+// channelDisplayName resolves the display name used for per-message channel
+// attribution, falling back to the instance name when no annotation is set.
+func channelDisplayName(instance *sympoziumv1alpha1.SympoziumInstance) string {
+	if dn := instance.Annotations[DisplayNameAnnotation]; dn != "" {
+		return dn
+	}
+	return instance.Name
+}
+
 // buildChannelDeployment creates a Deployment spec for a channel pod.
 func (r *SympoziumInstanceReconciler) buildChannelDeployment(
 	instance *sympoziumv1alpha1.SympoziumInstance,
@@ -217,6 +231,10 @@ func (r *SympoziumInstanceReconciler) buildChannelDeployment(
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Env: []corev1.EnvVar{
 								{Name: "INSTANCE_NAME", Value: instance.Name},
+								// AGENT_DISPLAY_NAME drives per-message sender
+								// attribution (e.g. the Slack `username`) so an
+								// Ensemble's shared bot posts as the right agent.
+								{Name: "AGENT_DISPLAY_NAME", Value: channelDisplayName(instance)},
 								{Name: "EVENT_BUS_URL", Value: "nats://nats.sympozium-system.svc:4222"},
 								{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: resolveOTelEndpoint(instance)},
 								{Name: "OTEL_EXPORTER_OTLP_PROTOCOL", Value: "grpc"},

@@ -244,6 +244,13 @@ func (r *PersonaPackReconciler) buildInstance(
 		model = "gpt-4o" // sensible default; overridden by onboarding
 	}
 
+	// Carry the persona's human-readable name onto the instance so channel
+	// pods can attribute outbound messages to the right agent (ISI-1409).
+	displayName := persona.DisplayName
+	if displayName == "" {
+		displayName = persona.Name
+	}
+
 	inst := &sympoziumv1alpha1.SympoziumInstance{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instanceName,
@@ -251,6 +258,9 @@ func (r *PersonaPackReconciler) buildInstance(
 			Labels: map[string]string{
 				"sympozium.ai/persona-pack": pack.Name,
 				"sympozium.ai/persona":      persona.Name,
+			},
+			Annotations: map[string]string{
+				DisplayNameAnnotation: displayName,
 			},
 		},
 		Spec: sympoziumv1alpha1.SympoziumInstanceSpec{
