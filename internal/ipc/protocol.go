@@ -81,6 +81,12 @@ type OutboundMessage struct {
 	Text     string          `json:"text"`
 	Format   string          `json:"format,omitempty"` // "plain", "markdown", "html"
 	Metadata json.RawMessage `json:"metadata,omitempty"`
+
+	// Per-message sender attribution (see channel.OutboundMessage). Lets an
+	// agent post under its own display name/avatar through a shared bot.
+	Username  string `json:"username,omitempty"`
+	IconURL   string `json:"iconUrl,omitempty"`
+	IconEmoji string `json:"iconEmoji,omitempty"`
 }
 
 // StatusUpdate is written to /ipc/output/status.json for agent status.

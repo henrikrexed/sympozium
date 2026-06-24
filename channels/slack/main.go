@@ -44,10 +44,16 @@ type SlackChannel struct {
 	channel.BaseChannel
 	BotToken string
 	AppToken string // xapp-... token for Socket Mode (optional)
-	log      logr.Logger
-	client   *http.Client
-	healthy  bool
-	mu       sync.RWMutex
+	// DisplayName is this agent's human-readable name. It is used as the
+	// default per-message sender identity (Slack `username`) when an
+	// outbound message does not carry its own attribution, so an Ensemble's
+	// shared bot posts as the right agent. Sourced from AGENT_DISPLAY_NAME,
+	// falling back to INSTANCE_NAME. Requires the chat:write.customize scope.
+	DisplayName string
+	log         logr.Logger
+	client      *http.Client
+	healthy     bool
+	mu          sync.RWMutex
 }
 
 func main() {
@@ -56,13 +62,21 @@ func main() {
 	var botToken string
 	var appToken string
 	var listenAddr string
+	var displayName string
 
 	flag.StringVar(&instanceName, "instance", os.Getenv("INSTANCE_NAME"), "SympoziumInstance name")
 	flag.StringVar(&eventBusURL, "event-bus-url", os.Getenv("EVENT_BUS_URL"), "Event bus URL")
 	flag.StringVar(&botToken, "bot-token", os.Getenv("SLACK_BOT_TOKEN"), "Slack bot token (xoxb-...)")
 	flag.StringVar(&appToken, "app-token", os.Getenv("SLACK_APP_TOKEN"), "Slack app token (xapp-...) for Socket Mode")
 	flag.StringVar(&listenAddr, "addr", ":3000", "Listen address for Events API fallback")
+	flag.StringVar(&displayName, "display-name", os.Getenv("AGENT_DISPLAY_NAME"), "Agent display name for per-message Slack attribution")
 	flag.Parse()
+
+	// Fall back to the instance name when no explicit display name is set, so
+	// per-agent attribution still works without extra configuration.
+	if displayName == "" {
+		displayName = instanceName
+	}
 
 	if botToken == "" {
 		fmt.Fprintln(os.Stderr, "SLACK_BOT_TOKEN is required")
@@ -84,10 +98,11 @@ func main() {
 			InstanceName: instanceName,
 			EventBus:     bus,
 		},
-		BotToken: botToken,
-		AppToken: appToken,
-		log:      log,
-		client:   &http.Client{Timeout: 30 * time.Second},
+		BotToken:    botToken,
+		AppToken:    appToken,
+		DisplayName: displayName,
+		log:         log,
+		client:      &http.Client{Timeout: 30 * time.Second},
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -440,13 +455,26 @@ func (sc *SlackChannel) handleOutbound(ctx context.Context) {
 			if msg.Channel != "slack" {
 				continue
 			}
+			// In an Ensemble every persona runs its own slack channel pod but
+			// they all share one bot token and subscribe to the same send
+			// topic. Without an instance filter each pod would re-send every
+			// agent's reply (duplicate posts, and the wrong sender identity).
+			// The router/bridge stamp the originating instance on the event
+			// metadata; only the matching pod delivers it. Stay permissive
+			// when either side is unset to preserve single-instance behaviour.
+			if mi := event.Metadata["instanceName"]; mi != "" && sc.InstanceName != "" && mi != sc.InstanceName {
+				continue
+			}
 			_ = sc.sendMessage(ctx, msg)
 		}
 	}
 }
 
-// sendMessage sends a message via the Slack chat.postMessage API.
-func (sc *SlackChannel) sendMessage(ctx context.Context, msg channel.OutboundMessage) error {
+// buildPostMessagePayload assembles the chat.postMessage body, applying
+// per-message sender attribution. defaultUsername is this pod's own agent
+// display name, used when the message carries no explicit Username so an
+// Ensemble's shared bot still posts as the right agent.
+func buildPostMessagePayload(msg channel.OutboundMessage, defaultUsername string) map[string]interface{} {
 	payload := map[string]interface{}{
 		"channel": msg.ChatID,
 		"text":    msg.Text,
@@ -454,6 +482,30 @@ func (sc *SlackChannel) sendMessage(ctx context.Context, msg channel.OutboundMes
 	if msg.ThreadID != "" {
 		payload["thread_ts"] = msg.ThreadID
 	}
+
+	// Per-message sender attribution (requires the chat:write.customize bot
+	// scope). Prefer the identity carried on the message; otherwise fall back
+	// to this pod's own agent display name.
+	username := msg.Username
+	if username == "" {
+		username = defaultUsername
+	}
+	if username != "" {
+		payload["username"] = username
+	}
+	// icon_url and icon_emoji are mutually exclusive in the Slack API; prefer
+	// an explicit URL when both are provided.
+	if msg.IconURL != "" {
+		payload["icon_url"] = msg.IconURL
+	} else if msg.IconEmoji != "" {
+		payload["icon_emoji"] = msg.IconEmoji
+	}
+	return payload
+}
+
+// sendMessage sends a message via the Slack chat.postMessage API.
+func (sc *SlackChannel) sendMessage(ctx context.Context, msg channel.OutboundMessage) error {
+	payload := buildPostMessagePayload(msg, sc.DisplayName)
 
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,

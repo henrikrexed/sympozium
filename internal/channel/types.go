@@ -30,6 +30,16 @@ type OutboundMessage struct {
 	Text     string `json:"text"`
 	Format   string `json:"format,omitempty"` // plain, markdown, html
 	ReplyTo  string `json:"replyTo,omitempty"`
+
+	// Per-message sender attribution. Used by Ensembles so a single bot
+	// identity can post as distinct agents (board-approved per ISI-1403:
+	// per-message attribution, not one Slack app per agent). Currently
+	// honoured by the Slack channel (requires the chat:write.customize bot
+	// scope); other channels ignore these fields. When unset, the channel
+	// falls back to its own configured identity.
+	Username  string `json:"username,omitempty"`  // display name to post as
+	IconURL   string `json:"iconUrl,omitempty"`   // avatar image URL
+	IconEmoji string `json:"iconEmoji,omitempty"` // avatar emoji, e.g. ":robot_face:"
 }
 
 // Attachment represents a file or media attachment.

@@ -40,6 +40,11 @@ For reliable Slack connectivity, configure your Slack app with both tokens and r
     - `message.im`
     - `message.channels`
     - `app_mention`
+- Add the `chat:write.customize` bot scope (in addition to `chat:write`) — this
+  lets a single bot post each message under a distinct `username`/`icon`. It is
+  what powers **per-agent attribution** in an Ensemble, where every persona
+  shares one Slack app but should appear as its own sender. The display name is
+  taken from the persona's `displayName` (falling back to the instance name).
 - Reinstall the app after changing scopes or event subscriptions
 
 !!! warning
