@@ -508,27 +508,109 @@ func buildPostMessagePayload(msg channel.OutboundMessage, defaultUsername string
 	return payload
 }
 
-// sendMessage sends a message via the Slack chat.postMessage API.
-func (sc *SlackChannel) sendMessage(ctx context.Context, msg channel.OutboundMessage) error {
-	payload := buildPostMessagePayload(msg, sc.DisplayName)
+// slackAPIResponse is the common envelope returned by Slack Web API calls.
+// chat.postMessage and conversations.join both set ok=false plus an error
+// string on failure; previously these were discarded, so a bot that was not a
+// member of the target channel failed silently (the channel_not_found /
+// not_in_channel outbound failures tracked in ISI-1411).
+type slackAPIResponse struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error"`
+}
 
+// shouldAttemptJoin reports whether a chat.postMessage failure is one a shared
+// bot can self-heal by joining the channel and retrying. conversations.join
+// only works for public channels (IDs prefixed "C"); private channels ("G")
+// and DMs ("D") require an explicit /invite, so we do not attempt a join that
+// would always fail.
+func shouldAttemptJoin(chatID, slackErr string) bool {
+	switch slackErr {
+	case "not_in_channel", "channel_not_found":
+	default:
+		return false
+	}
+	return strings.HasPrefix(chatID, "C")
+}
+
+// sendMessage sends a message via the Slack chat.postMessage API. When the bot
+// is not a member of the target public channel it joins the channel once and
+// retries, resolving the channel_not_found / not_in_channel outbound failures
+// for a shared Ensemble bot (ISI-1411). Requires the channels:join bot scope.
+func (sc *SlackChannel) sendMessage(ctx context.Context, msg channel.OutboundMessage) error {
+	resp, err := sc.postMessage(ctx, msg)
+	if err != nil {
+		sc.log.Error(err, "slack chat.postMessage request failed", "chatId", msg.ChatID)
+		return err
+	}
+	if resp.OK {
+		return nil
+	}
+
+	if shouldAttemptJoin(msg.ChatID, resp.Error) {
+		sc.log.Info("slack post rejected, joining channel and retrying",
+			"chatId", msg.ChatID, "error", resp.Error)
+		if jerr := sc.joinChannel(ctx, msg.ChatID); jerr != nil {
+			sc.log.Error(jerr, "slack conversations.join failed", "chatId", msg.ChatID)
+			return jerr
+		}
+		resp, err = sc.postMessage(ctx, msg)
+		if err != nil {
+			sc.log.Error(err, "slack chat.postMessage retry request failed", "chatId", msg.ChatID)
+			return err
+		}
+		if resp.OK {
+			return nil
+		}
+	}
+
+	rerr := fmt.Errorf("slack chat.postMessage: %s", resp.Error)
+	sc.log.Error(rerr, "slack send rejected", "chatId", msg.ChatID)
+	return rerr
+}
+
+// postMessage performs a single chat.postMessage call and decodes the Slack
+// API envelope so callers can inspect the ok/error result.
+func (sc *SlackChannel) postMessage(ctx context.Context, msg channel.OutboundMessage) (slackAPIResponse, error) {
+	payload := buildPostMessagePayload(msg, sc.DisplayName)
 	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://slack.com/api/chat.postMessage",
-		strings.NewReader(string(body)))
+	return sc.slackPost(ctx, "https://slack.com/api/chat.postMessage", body)
+}
+
+// joinChannel makes the bot a member of a public channel via conversations.join
+// so it can both post to and receive message.channels events from that channel.
+func (sc *SlackChannel) joinChannel(ctx context.Context, chatID string) error {
+	body, _ := json.Marshal(map[string]string{"channel": chatID})
+	resp, err := sc.slackPost(ctx, "https://slack.com/api/conversations.join", body)
 	if err != nil {
 		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("conversations.join: %s", resp.Error)
+	}
+	return nil
+}
+
+// slackPost POSTs a JSON body to a Slack Web API method with the bot token and
+// decodes the shared ok/error envelope.
+func (sc *SlackChannel) slackPost(ctx context.Context, url string, body []byte) (slackAPIResponse, error) {
+	var out slackAPIResponse
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(body)))
+	if err != nil {
+		return out, err
 	}
 	req.Header.Set("Authorization", "Bearer "+sc.BotToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := sc.client.Do(req)
 	if err != nil {
-		return err
+		return out, err
 	}
 	defer resp.Body.Close()
 
-	return nil
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, fmt.Errorf("decoding slack response from %s: %w", url, err)
+	}
+	return out, nil
 }
 
 // setHealthy updates the health status and publishes it to the event bus.
