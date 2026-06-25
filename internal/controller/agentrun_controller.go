@@ -978,6 +978,13 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 					"sympozium.ai/ensemble":        ensembleName,
 					"sympozium.ai/sequential-from": agentRun.Name,
 				},
+				// Carry the channel reply-routing annotations forward (ISI-1442).
+				// When the pipeline started from an inbound Slack message, the
+				// originating run holds sympozium.ai/reply-channel + reply-chat-id
+				// (+thread/ts); without this the successor's output has no reply
+				// target and is silently dropped. Absent on non-channel runs,
+				// leaving the successor annotation-free.
+				Annotations: propagateReplyAnnotations(nil, agentRun.Annotations),
 			},
 			Spec: sympoziumv1alpha1.AgentRunSpec{
 				AgentRef: targetAgentName,
