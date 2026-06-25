@@ -991,6 +991,11 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 		if tp := agentRun.Annotations["otel.dev/traceparent"]; tp != "" {
 			successorAnnotations["otel.dev/traceparent"] = tp
 		}
+		// Carry the channel reply-routing annotations forward (ISI-1442). When
+		// the pipeline started from an inbound Slack message, the originating run
+		// holds sympozium.ai/reply-channel + reply-chat-id (+thread/ts); without
+		// this the successor's output has no reply target and is dropped.
+		successorAnnotations = propagateReplyAnnotations(successorAnnotations, agentRun.Annotations)
 
 		successorRun := &sympoziumv1alpha1.AgentRun{
 			ObjectMeta: metav1.ObjectMeta{

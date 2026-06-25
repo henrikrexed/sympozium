@@ -404,6 +404,38 @@ func (cr *ChannelRouter) handleInbound(ctx context.Context, event *eventbus.Even
 	)
 }
 
+// replyRoutingAnnotationKeys lists the annotations that identify where a
+// channel-originated AgentRun's output must be routed back to (Slack channel,
+// chat/DM, thread, and the message timestamp used for threaded replies).
+// They are stamped on the parent inbound run above (createRun) and read by
+// handleCompleted below and by the agent pod env builder
+// (agentrun_controller.go SOURCE_CHANNEL/SOURCE_CHAT_ID/SOURCE_THREAD_ID).
+//
+// Children spawned off a channel-originated run (Ensemble stimulus and
+// sequential/pipeline successors) must carry these forward, otherwise their
+// output has no reply target and is silently dropped (ISI-1442).
+var replyRoutingAnnotationKeys = []string{
+	"sympozium.ai/reply-channel",
+	"sympozium.ai/reply-chat-id",
+	"sympozium.ai/reply-thread-id",
+	"sympozium.ai/reply-message-ts",
+}
+
+// propagateReplyAnnotations copies any reply-routing annotations present in src
+// into dst (allocating dst if needed) and returns dst. Keys absent from src are
+// skipped so non-channel runs stay annotation-free. Safe to call with a nil dst.
+func propagateReplyAnnotations(dst, src map[string]string) map[string]string {
+	for _, k := range replyRoutingAnnotationKeys {
+		if v, ok := src[k]; ok && v != "" {
+			if dst == nil {
+				dst = map[string]string{}
+			}
+			dst[k] = v
+		}
+	}
+	return dst
+}
+
 // agentResult matches the result structure emitted by the agent-runner.
 type agentResult struct {
 	Status   string `json:"status"`
