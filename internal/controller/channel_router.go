@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -32,6 +33,66 @@ type ChannelRouter struct {
 	Client   client.Client
 	EventBus eventbus.EventBus
 	Log      logr.Logger
+
+	// seen tracks recently-processed inbound message idempotency keys so a
+	// single channel message produces exactly one AgentRun, even when the
+	// same event is delivered more than once (ISI-1427). Slack in particular
+	// retries unacked events and, for a shared-app Ensemble, keeps multiple
+	// Socket Mode connections that can each deliver the same event_callback.
+	// The router is the single chokepoint before run creation (it runs only
+	// on the leader), so an in-memory TTL set here dedups duplicates that
+	// arrive via different channel pods. Keyed by channel+idempotency key.
+	seenMu sync.Mutex
+	seen   map[string]time.Time
+}
+
+// dedupTTL is how long an inbound idempotency key is remembered. It must
+// comfortably exceed Slack's retry window (~30 min of backoff retries) while
+// staying short enough that a legitimate identical re-send much later is not
+// dropped.
+const dedupTTL = 1 * time.Hour
+
+// inboundDedupKey derives an idempotency key for an inbound message. It prefers
+// Slack's event_id (stable across retries and across multiple Socket Mode
+// connections for the same app), then client_msg_id, then falls back to
+// channel+chat+timestamp. Returns "" when no stable key is available, in which
+// case the caller does not dedup (preserves behaviour for channels that do not
+// supply one).
+func inboundDedupKey(msg channelpkg.InboundMessage) string {
+	if id := msg.Metadata["slackEventId"]; id != "" {
+		return msg.Channel + "/" + id
+	}
+	if id := msg.Metadata["slackClientMsgId"]; id != "" {
+		return msg.Channel + "/" + id
+	}
+	if ts := msg.Metadata["ts"]; ts != "" {
+		return msg.Channel + "/" + msg.ChatID + "/" + ts
+	}
+	return ""
+}
+
+// alreadyProcessed records the key and reports whether it was seen within the
+// TTL. It also evicts expired keys so the set stays bounded. An empty key is
+// never considered a duplicate.
+func (cr *ChannelRouter) alreadyProcessed(key string, now time.Time) bool {
+	if key == "" {
+		return false
+	}
+	cr.seenMu.Lock()
+	defer cr.seenMu.Unlock()
+	if cr.seen == nil {
+		cr.seen = make(map[string]time.Time)
+	}
+	for k, t := range cr.seen {
+		if now.Sub(t) > dedupTTL {
+			delete(cr.seen, k)
+		}
+	}
+	if t, ok := cr.seen[key]; ok && now.Sub(t) <= dedupTTL {
+		return true
+	}
+	cr.seen[key] = now
+	return false
 }
 
 // Start begins listening for inbound channel messages and completed agent runs.
@@ -104,6 +165,17 @@ func (cr *ChannelRouter) handleInbound(ctx context.Context, event *eventbus.Even
 		return
 	}
 
+	// Idempotency: drop a duplicate delivery of the same channel message before
+	// it spawns a second AgentRun. Without this, one Slack message can produce
+	// the same response many times (ISI-1427) when Slack retries the event or a
+	// shared-app Ensemble delivers it over multiple Socket Mode connections.
+	dedupKey := inboundDedupKey(msg)
+	if cr.alreadyProcessed(dedupKey, time.Now()) {
+		cr.Log.Info("Skipping duplicate inbound message",
+			"instance", msg.InstanceName, "channel", msg.Channel, "dedupKey", dedupKey)
+		return
+	}
+
 	ctx, span := routerTracer.Start(ctx, "channel_router.handle_inbound",
 		trace.WithAttributes(
 			attribute.String("sympozium.channel", msg.Channel),
@@ -161,6 +233,7 @@ func (cr *ChannelRouter) handleInbound(ctx context.Context, event *eventbus.Even
 				"sympozium.ai/reply-chat-id": msg.ChatID,
 				"sympozium.ai/sender-name":   msg.SenderName,
 				"sympozium.ai/sender-id":     msg.SenderID,
+				"sympozium.ai/dedup-key":     dedupKey,
 			},
 		},
 		Spec: sympoziumv1alpha1.AgentRunSpec{
