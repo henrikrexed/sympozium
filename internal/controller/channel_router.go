@@ -257,20 +257,42 @@ func (cr *ChannelRouter) handleInbound(ctx context.Context, event *eventbus.Even
 		return
 	}
 
-	// Resolve model configuration from the Agent (same logic as TUI).
+	// Resolve which persona Agent this inbound message targets. In an Ensemble,
+	// a message addressed to a named persona (e.g. "@cto ..." or "cto: ...") is
+	// routed to that persona's Agent; otherwise it falls back to the Agent that
+	// received the message (the Ensemble default for this channel) — never an
+	// unconditional "primary" (ISI-1443). All downstream config (provider, auth,
+	// model, skills, system prompt, run ownership labels) is read from the
+	// resolved Agent.
+	inst, agentID := cr.resolvePersona(ctx, inst, msg)
+	span.SetAttributes(
+		attribute.String("sympozium.agent.id", agentID),
+		attribute.String("sympozium.instance.resolved", inst.Name),
+	)
+
+	// Resolve model configuration from the resolved Agent (same logic as TUI).
 	provider := resolveProvider(inst)
 	authSecret := resolveAuthSecret(inst)
+
+	// Run ownership labels. instance/agent-config attribute the run to the
+	// resolved persona so the Ensemble controller's per-instance run queries
+	// (and sequential/stimulus follow-ups) target the right persona.
+	runLabels := map[string]string{
+		"sympozium.ai/instance":       inst.Name,
+		"sympozium.ai/source":         "channel",
+		"sympozium.ai/source-channel": msg.Channel,
+	}
+	if ens := inst.Labels["sympozium.ai/ensemble"]; ens != "" {
+		runLabels["sympozium.ai/ensemble"] = ens
+		runLabels["sympozium.ai/agent-config"] = agentID
+	}
 
 	// Create an AgentRun for the inbound message.
 	run := &sympoziumv1alpha1.AgentRun{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: msg.InstanceName + "-ch-",
+			GenerateName: inst.Name + "-ch-",
 			Namespace:    inst.Namespace,
-			Labels: map[string]string{
-				"sympozium.ai/instance":       msg.InstanceName,
-				"sympozium.ai/source":         "channel",
-				"sympozium.ai/source-channel": msg.Channel,
-			},
+			Labels:       runLabels,
 			Annotations: map[string]string{
 				"sympozium.ai/reply-channel":    msg.Channel,
 				"sympozium.ai/reply-chat-id":    msg.ChatID,
@@ -281,8 +303,8 @@ func (cr *ChannelRouter) handleInbound(ctx context.Context, event *eventbus.Even
 			},
 		},
 		Spec: sympoziumv1alpha1.AgentRunSpec{
-			AgentRef:   msg.InstanceName,
-			AgentID:    "primary",
+			AgentRef:   inst.Name,
+			AgentID:    agentID,
 			SessionKey: fmt.Sprintf("channel-%s-%s-%d", msg.Channel, msg.ChatID, time.Now().UnixNano()),
 			Task:       msg.Text,
 			Model: sympoziumv1alpha1.ModelSpec{
@@ -326,6 +348,91 @@ func (cr *ChannelRouter) handleInbound(ctx context.Context, event *eventbus.Even
 		"instance", msg.InstanceName,
 		"channel", msg.Channel,
 	)
+}
+
+// resolvePersona determines which persona Agent an inbound channel message
+// targets and returns that Agent plus the AgentID to stamp on the run.
+//
+// The receiving Agent (inst) is the one whose channel pod published the
+// message. When that Agent is a member of an Ensemble and the message text is
+// explicitly addressed to a sibling persona (e.g. "@cto deploy" or
+// "cto: deploy"), routing switches to that sibling's Agent so the run carries
+// its model/skills/system-prompt and is attributed to it. Otherwise routing
+// falls back to the receiving Agent — the Ensemble default for this channel —
+// never an unconditional "primary" (ISI-1443).
+//
+// The returned AgentID is the resolved persona's agent-config name when the
+// Agent belongs to an Ensemble, falling back to "primary" only for a
+// standalone (non-Ensemble) Agent that carries no agent-config label.
+func (cr *ChannelRouter) resolvePersona(
+	ctx context.Context,
+	inst *sympoziumv1alpha1.Agent,
+	msg channelpkg.InboundMessage,
+) (*sympoziumv1alpha1.Agent, string) {
+	ensemble := inst.Labels["sympozium.ai/ensemble"]
+
+	// Default AgentID: the receiving Agent's own persona name, or the historical
+	// "primary" literal for a standalone Agent with no persona identity.
+	defaultAgentID := inst.Labels["sympozium.ai/agent-config"]
+	if defaultAgentID == "" {
+		defaultAgentID = "primary"
+	}
+
+	// Persona routing only applies within an Ensemble; a standalone Agent has a
+	// single configuration and nowhere to route.
+	if ensemble == "" {
+		return inst, defaultAgentID
+	}
+
+	addressed := addressedPersona(msg.Text)
+	if addressed == "" {
+		return inst, defaultAgentID
+	}
+
+	// The message is addressed to a named persona: find the sibling Agent in the
+	// same Ensemble whose agent-config name matches.
+	var siblings sympoziumv1alpha1.AgentList
+	if err := cr.Client.List(ctx, &siblings,
+		client.InNamespace(inst.Namespace),
+		client.MatchingLabels{"sympozium.ai/ensemble": ensemble}); err != nil {
+		cr.Log.Error(err, "failed to list ensemble siblings for persona routing — using default persona",
+			"instance", inst.Name, "ensemble", ensemble)
+		return inst, defaultAgentID
+	}
+
+	for i := range siblings.Items {
+		sib := &siblings.Items[i]
+		cfg := sib.Labels["sympozium.ai/agent-config"]
+		if cfg != "" && strings.EqualFold(cfg, addressed) {
+			return sib, cfg
+		}
+	}
+
+	// Addressed a name that is not a persona in this Ensemble: keep the default.
+	return inst, defaultAgentID
+}
+
+// addressedPersona extracts an explicitly-addressed persona name from the start
+// of an inbound message. It only treats the first token as an address when it
+// carries an unambiguous marker — a leading "@" (mention style) or a trailing
+// ":" (salutation style) — so an ordinary first word that happens to equal a
+// persona name is not misread as a routing directive. Returns the lowercased
+// bare name, or "" when no persona is addressed.
+func addressedPersona(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	first := strings.Fields(trimmed)[0]
+	switch {
+	case strings.HasPrefix(first, "@"):
+		first = strings.TrimPrefix(first, "@")
+	case strings.HasSuffix(first, ":"):
+		// keep as-is; trailing punctuation stripped below
+	default:
+		return ""
+	}
+	return strings.ToLower(strings.Trim(first, ":,@"))
 }
 
 // agentResult matches the result structure emitted by the agent-runner.
