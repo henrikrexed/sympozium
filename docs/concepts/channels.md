@@ -39,8 +39,26 @@ For reliable Slack connectivity, configure your Slack app with both tokens and r
 - Add bot event subscriptions:
     - `message.im`
     - `message.channels`
+    - `message.groups` (private channels)
     - `app_mention`
+- Add the `channels:join` bot scope — the channel pod self-heals membership by
+  calling `conversations.join` on a public channel the first time a post is
+  rejected with `not_in_channel` / `channel_not_found`, then retries the post
+  (ISI-1411).
 - Reinstall the app after changing scopes or event subscriptions
+
+### Channel membership
+
+Slack only delivers `message.channels` events for, and only accepts
+`chat.postMessage` to, channels the bot is **a member of**. A bot that is not in
+the target channel both fails to receive inbound messages and gets
+`channel_not_found` on outbound replies.
+
+- **Public channels** are joined automatically on first send (requires the
+  `channels:join` scope above). You can also `/invite @your-bot` proactively so
+  it starts receiving inbound events before the first reply.
+- **Private channels and DMs** cannot be auto-joined; `/invite @your-bot` (or
+  opening a DM) is required. The pod does not attempt a join that would fail.
 
 !!! warning
     If `SLACK_APP_TOKEN` is omitted, Sympozium falls back to Slack Events API mode, which requires a publicly reachable webhook URL.
