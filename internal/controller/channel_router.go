@@ -52,6 +52,11 @@ type ChannelRouter struct {
 // dropped.
 const dedupTTL = 1 * time.Hour
 
+// channelRouterGroup is the durable queue-group name for ChannelRouter's inbound
+// subscriptions. Replicas of this router share it (and thus load-balance); other
+// logical subscribers to the same topics use their own group and are unaffected.
+const channelRouterGroup = "channel-router"
+
 // inboundDedupKey derives an idempotency key for an inbound message. It prefers
 // Slack's event_id (stable across retries and across multiple Socket Mode
 // connections for the same app), then client_msg_id, then falls back to
@@ -100,14 +105,20 @@ func (cr *ChannelRouter) alreadyProcessed(key string, now time.Time) bool {
 func (cr *ChannelRouter) Start(ctx context.Context) error {
 	cr.Log.Info("Starting channel message router")
 
-	// Subscribe to inbound channel messages.
-	inboundCh, err := cr.EventBus.Subscribe(ctx, eventbus.TopicChannelMessageRecv)
+	// Subscribe via a durable queue group so that, should the controller ever run
+	// with replicas>1 without leader election, ChannelRouter instances load-balance
+	// inbound events instead of every replica receiving every event and re-creating
+	// the same AgentRun. The in-memory dedup above + leader election remain the
+	// belt-and-suspenders guards on top of this chokepoint (ISI-1430).
+	inboundCh, err := cr.EventBus.SubscribeGroup(ctx, eventbus.TopicChannelMessageRecv, channelRouterGroup)
 	if err != nil {
 		return fmt.Errorf("subscribing to %s: %w", eventbus.TopicChannelMessageRecv, err)
 	}
 
-	// Subscribe to completed agent runs to route responses back.
-	completedCh, err := cr.EventBus.Subscribe(ctx, eventbus.TopicAgentRunCompleted)
+	// Subscribe to completed agent runs to route responses back. Same queue group:
+	// a distinct group from spawn-router / web proxies, so each of those still
+	// receives its own copy of every completed run.
+	completedCh, err := cr.EventBus.SubscribeGroup(ctx, eventbus.TopicAgentRunCompleted, channelRouterGroup)
 	if err != nil {
 		return fmt.Errorf("subscribing to %s: %w", eventbus.TopicAgentRunCompleted, err)
 	}

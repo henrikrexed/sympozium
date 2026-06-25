@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -93,7 +94,11 @@ func (n *NATSEventBus) Publish(ctx context.Context, topic string, event *Event) 
 	return nil
 }
 
-// Subscribe returns a channel that receives events for the given topic.
+// Subscribe returns a channel that receives events for the given topic using an
+// ephemeral, non-load-balanced consumer: every Subscribe call gets its own
+// consumer and therefore receives every matching message (fan-out). Use this for
+// distinct logical consumers that each need their own copy of an event, or for
+// dynamic per-run subjects.
 func (n *NATSEventBus) Subscribe(ctx context.Context, topic string) (<-chan *Event, error) {
 	subject := topicToSubject(topic)
 
@@ -106,6 +111,44 @@ func (n *NATSEventBus) Subscribe(ctx context.Context, topic string) (<-chan *Eve
 		return nil, fmt.Errorf("creating consumer for %s: %w", subject, err)
 	}
 
+	return n.drain(ctx, consumer), nil
+}
+
+// SubscribeGroup returns a channel that receives events for the given topic via a
+// durable queue-group consumer shared by all subscribers using the same group.
+//
+// Multiple instances of one logical subscriber (e.g. ChannelRouter replicas) that
+// call SubscribeGroup with the same group bind to the same durable JetStream
+// consumer and load-balance: each message is delivered to exactly one instance,
+// not fanned out to all of them. Distinct groups bind to distinct durables and so
+// remain independent — each group still receives its own copy of every event.
+//
+// This is the defense-in-depth chokepoint for ISI-1430: even if a controller were
+// run with replicas>1 without leader election, a shared queue group collapses
+// duplicate inbound deliveries instead of every replica processing every event.
+// The leader-election guard remains belt-and-suspenders on top of this.
+func (n *NATSEventBus) SubscribeGroup(ctx context.Context, topic, group string) (<-chan *Event, error) {
+	subject := topicToSubject(topic)
+	durable := consumerName(group, subject)
+
+	consumer, err := n.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Durable:       durable,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverNewPolicy,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating durable consumer %s for %s: %w", durable, subject, err)
+	}
+
+	return n.drain(ctx, consumer), nil
+}
+
+// drain pumps messages from a JetStream consumer into a freshly created channel,
+// decoding each NATS message into an *Event and acking on successful hand-off.
+// Shared by Subscribe (ephemeral) and SubscribeGroup (durable queue group); the
+// only difference between the two is the consumer's identity, not how it drains.
+func (n *NATSEventBus) drain(ctx context.Context, consumer jetstream.Consumer) <-chan *Event {
 	ch := make(chan *Event, 64)
 
 	go func() {
@@ -142,7 +185,7 @@ func (n *NATSEventBus) Subscribe(ctx context.Context, topic string) (<-chan *Eve
 		}
 	}()
 
-	return ch, nil
+	return ch
 }
 
 // Close shuts down the NATS connection.
@@ -155,4 +198,28 @@ func (n *NATSEventBus) Close() error {
 // to a NATS subject under the sympozium namespace (e.g. "sympozium.agent.run.completed").
 func topicToSubject(topic string) string {
 	return "sympozium." + topic
+}
+
+// consumerName builds the durable JetStream consumer name for a queue group on a
+// given subject. All durables share the consumerGroup namespace prefix; the group
+// distinguishes one logical subscriber from another and the subject scopes the
+// durable to a single filter (a JetStream consumer has exactly one FilterSubject).
+// Two subscribers collapse onto the same durable — and thus load-balance — only
+// when both their group and subject match.
+func consumerName(group, subject string) string {
+	return sanitizeDurable(consumerGroup + "-" + group + "-" + subject)
+}
+
+// sanitizeDurable replaces characters NATS forbids in durable consumer names
+// ('.', '*', '>', '/', '\\', and whitespace) with '-'. Subjects are dotted, so
+// they must be sanitized before use as part of a durable name.
+func sanitizeDurable(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '.', '*', '>', '/', '\\', ' ', '\t', '\n':
+			return '-'
+		default:
+			return r
+		}
+	}, s)
 }
