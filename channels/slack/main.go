@@ -295,7 +295,7 @@ func (sc *SlackChannel) readSocketMode(ctx context.Context, conn *websocket.Conn
 // observability. Returns (msg, false) when the message must be
 // dropped.
 func (sc *SlackChannel) gateAndBuildInbound(
-	user, channelID, threadTS, ts, channelType, text string,
+	user, channelID, threadTS, ts, channelType, text, eventID, clientMsgID string,
 ) (channel.InboundMessage, bool) {
 	decision, reason := evaluateInbound(sc.cfg, sc.threads,
 		sc.BotID, user, channelID, threadTS, ts, channelType, text)
@@ -326,6 +326,13 @@ func (sc *SlackChannel) gateAndBuildInbound(
 		Text:     text,
 		Metadata: map[string]string{
 			"ts": ts,
+			// Slack idempotency keys for inbound dedup (ISI-1427). The same
+			// event_callback can reach the control plane more than once — Slack
+			// retries unacked events, and a shared-app Ensemble keeps multiple
+			// Socket Mode connections that Slack may each deliver to. The router
+			// dedups on these so one Slack message yields exactly one run.
+			"slackEventId":     eventID,
+			"slackClientMsgId": clientMsgID,
 		},
 	}, true
 }
@@ -334,8 +341,9 @@ func (sc *SlackChannel) gateAndBuildInbound(
 // The payload wraps an Events API envelope with type "event_callback".
 func (sc *SlackChannel) handleSocketEvent(ctx context.Context, payload json.RawMessage) {
 	var inner struct {
-		Type  string `json:"type"`
-		Event struct {
+		Type    string `json:"type"`
+		EventID string `json:"event_id"`
+		Event   struct {
 			Type        string `json:"type"`
 			User        string `json:"user"`
 			Text        string `json:"text"`
@@ -344,6 +352,7 @@ func (sc *SlackChannel) handleSocketEvent(ctx context.Context, payload json.RawM
 			TS          string `json:"ts"`
 			ThreadTS    string `json:"thread_ts"`
 			BotID       string `json:"bot_id"`
+			ClientMsgID string `json:"client_msg_id"`
 		} `json:"event"`
 	}
 	if err := json.Unmarshal(payload, &inner); err != nil {
@@ -361,6 +370,7 @@ func (sc *SlackChannel) handleSocketEvent(ctx context.Context, payload json.RawM
 	msg, ok := sc.gateAndBuildInbound(
 		inner.Event.User, inner.Event.Channel, inner.Event.ThreadTS,
 		inner.Event.TS, inner.Event.ChannelType, inner.Event.Text,
+		inner.EventID, inner.Event.ClientMsgID,
 	)
 	if !ok {
 		return
@@ -436,6 +446,7 @@ func (sc *SlackChannel) handleSlackEvents(w http.ResponseWriter, r *http.Request
 	var envelope struct {
 		Type      string `json:"type"`
 		Challenge string `json:"challenge"`
+		EventID   string `json:"event_id"`
 		Event     struct {
 			Type        string `json:"type"`
 			User        string `json:"user"`
@@ -445,6 +456,7 @@ func (sc *SlackChannel) handleSlackEvents(w http.ResponseWriter, r *http.Request
 			TS          string `json:"ts"`
 			ThreadTS    string `json:"thread_ts"`
 			BotID       string `json:"bot_id"`
+			ClientMsgID string `json:"client_msg_id"`
 		} `json:"event"`
 	}
 
@@ -476,6 +488,7 @@ func (sc *SlackChannel) handleSlackEvents(w http.ResponseWriter, r *http.Request
 		msg, ok := sc.gateAndBuildInbound(
 			envelope.Event.User, envelope.Event.Channel, envelope.Event.ThreadTS,
 			envelope.Event.TS, envelope.Event.ChannelType, envelope.Event.Text,
+			envelope.EventID, envelope.Event.ClientMsgID,
 		)
 		if !ok {
 			w.WriteHeader(http.StatusOK)
