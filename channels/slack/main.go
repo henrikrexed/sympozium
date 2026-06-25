@@ -536,36 +536,49 @@ type slackAPIResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
-// callSlackAPI performs a JSON POST to the given Slack Web API endpoint
-// and returns an error when either the transport fails, the HTTP status
-// is non-2xx, or Slack reports ok:false. Errors classified as benign
-// (passed via okErrors) are treated as success.
-func (sc *SlackChannel) callSlackAPI(ctx context.Context, endpoint string, payload interface{}, okErrors ...string) error {
+// rawSlackAPICall performs a JSON POST to a Slack Web API endpoint and returns
+// the decoded ok/error envelope. It returns an error only for transport, HTTP
+// status, or decode failures — a soft failure (HTTP 200 with ok:false) is
+// surfaced via the returned envelope so callers can react to a specific error
+// code (e.g. rejoining a channel) instead of just failing.
+func (sc *SlackChannel) rawSlackAPICall(ctx context.Context, endpoint string, payload interface{}) (slackAPIResponse, error) {
+	var parsed slackAPIResponse
+
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal payload: %w", err)
+		return parsed, fmt.Errorf("marshal payload: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return parsed, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+sc.BotToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := sc.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("http: %w", err)
+		return parsed, fmt.Errorf("http: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("slack %s returned HTTP %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return parsed, fmt.Errorf("slack %s returned HTTP %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
-
-	var parsed slackAPIResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return fmt.Errorf("decode slack response: %w (body=%q)", err, string(respBody))
+		return parsed, fmt.Errorf("decode slack response: %w (body=%q)", err, string(respBody))
+	}
+	return parsed, nil
+}
+
+// callSlackAPI performs a JSON POST to the given Slack Web API endpoint
+// and returns an error when either the transport fails, the HTTP status
+// is non-2xx, or Slack reports ok:false. Errors classified as benign
+// (passed via okErrors) are treated as success.
+func (sc *SlackChannel) callSlackAPI(ctx context.Context, endpoint string, payload interface{}, okErrors ...string) error {
+	parsed, err := sc.rawSlackAPICall(ctx, endpoint, payload)
+	if err != nil {
+		return err
 	}
 	if parsed.OK {
 		return nil
@@ -578,8 +591,27 @@ func (sc *SlackChannel) callSlackAPI(ctx context.Context, endpoint string, paylo
 	return fmt.Errorf("slack %s rejected request: %s", endpoint, parsed.Error)
 }
 
-// sendMessage sends a message via the Slack chat.postMessage API.
+// shouldAttemptJoin reports whether a chat.postMessage failure is one a shared
+// bot can self-heal by joining the channel and retrying. conversations.join
+// only works for public channels (IDs prefixed "C"); private channels ("G")
+// and DMs ("D") require an explicit /invite, so we do not attempt a join that
+// would always fail.
+func shouldAttemptJoin(chatID, slackErr string) bool {
+	switch slackErr {
+	case "not_in_channel", "channel_not_found":
+	default:
+		return false
+	}
+	return strings.HasPrefix(chatID, "C")
+}
+
+// sendMessage sends a message via the Slack chat.postMessage API. When the bot
+// is not a member of the target public channel it joins the channel once and
+// retries, resolving the channel_not_found / not_in_channel outbound failures
+// for a shared Ensemble bot (ISI-1411). Requires the channels:join bot scope.
 func (sc *SlackChannel) sendMessage(ctx context.Context, msg channel.OutboundMessage) error {
+	const postEndpoint = "https://slack.com/api/chat.postMessage"
+
 	payload := map[string]interface{}{
 		"channel": msg.ChatID,
 		"text":    msg.Text,
@@ -596,7 +628,32 @@ func (sc *SlackChannel) sendMessage(ctx context.Context, msg channel.OutboundMes
 	if threadTS != "" {
 		payload["thread_ts"] = threadTS
 	}
-	return sc.callSlackAPI(ctx, "https://slack.com/api/chat.postMessage", payload)
+
+	resp, err := sc.rawSlackAPICall(ctx, postEndpoint, payload)
+	if err != nil {
+		return err
+	}
+	if resp.OK {
+		return nil
+	}
+
+	if shouldAttemptJoin(msg.ChatID, resp.Error) {
+		sc.log.Info("slack post rejected, joining channel and retrying",
+			"chatId", msg.ChatID, "error", resp.Error)
+		if jerr := sc.callSlackAPI(ctx, "https://slack.com/api/conversations.join",
+			map[string]string{"channel": msg.ChatID}); jerr != nil {
+			return fmt.Errorf("join channel %s: %w", msg.ChatID, jerr)
+		}
+		resp, err = sc.rawSlackAPICall(ctx, postEndpoint, payload)
+		if err != nil {
+			return err
+		}
+		if resp.OK {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("slack %s rejected request: %s", postEndpoint, resp.Error)
 }
 
 // addReaction adds an emoji reaction to a message via the Slack
