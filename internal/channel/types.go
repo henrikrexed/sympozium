@@ -38,6 +38,18 @@ type OutboundMessage struct {
 	Reaction        string            `json:"reaction,omitempty"`        // emoji identifier (channel-specific format)
 	TargetMessageID string            `json:"targetMessageId,omitempty"` // inbound message id this reaction targets
 	Metadata        map[string]string `json:"metadata,omitempty"`        // channel-specific routing hints (e.g. Slack replyToTS)
+
+	// Optional per-message sender attribution. Currently honoured by the
+	// Slack channel, which maps them onto chat.postMessage's username /
+	// icon_url / icon_emoji overrides. They are empty for non-Slack
+	// channels and for single-identity Slack setups, leaving the payload
+	// byte-for-byte unchanged. In a multi-agent Ensemble each persona pod
+	// sets them so its replies post under its own display name and icon.
+	// Requires the Slack bot scope chat:write.customize. Channels that do
+	// not support sender overrides ignore these fields.
+	Username  string `json:"username,omitempty"`
+	IconURL   string `json:"iconUrl,omitempty"`
+	IconEmoji string `json:"iconEmoji,omitempty"`
 }
 
 // Attachment represents a file or media attachment.

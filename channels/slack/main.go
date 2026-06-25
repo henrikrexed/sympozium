@@ -52,6 +52,16 @@ type SlackChannel struct {
 	mu       sync.RWMutex
 	cfg      *slackConfig
 	threads  *threadEngagement
+
+	// Per-agent sender identity for chat.postMessage attribution. Empty by
+	// default, so a single-identity deployment posts exactly as before. In a
+	// multi-agent Ensemble each persona pod is one agent (it knows which via
+	// INSTANCE_NAME) and sets these so its replies appear under its own
+	// display name and icon. A per-message override on OutboundMessage takes
+	// precedence. Requires the Slack bot scope chat:write.customize.
+	displayName string
+	iconURL     string
+	iconEmoji   string
 }
 
 func main() {
@@ -94,6 +104,11 @@ func main() {
 		client:   &http.Client{Timeout: 30 * time.Second},
 		cfg:      loadSlackConfig(log),
 		threads:  newThreadEngagement(24 * time.Hour),
+		// Optional per-agent sender attribution (upstream #235). All empty by
+		// default => no behaviour change for single-identity setups.
+		displayName: os.Getenv("SLACK_DISPLAY_NAME"),
+		iconURL:     os.Getenv("SLACK_ICON_URL"),
+		iconEmoji:   os.Getenv("SLACK_ICON_EMOJI"),
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -596,6 +611,34 @@ func (sc *SlackChannel) sendMessage(ctx context.Context, msg channel.OutboundMes
 	if threadTS != "" {
 		payload["thread_ts"] = threadTS
 	}
+
+	// Per-message sender attribution (upstream #235). An explicit identity on
+	// the outbound message wins; otherwise fall back to this pod's per-agent
+	// identity. When both are empty (single-identity setups, non-attributing
+	// callers) the payload is identical to a plain bot post. icon_url and
+	// icon_emoji are mutually exclusive in the Slack API, so a URL wins over an
+	// emoji. Setting any of these requires the chat:write.customize bot scope.
+	username := msg.Username
+	if username == "" {
+		username = sc.displayName
+	}
+	if username != "" {
+		payload["username"] = username
+	}
+	iconURL := msg.IconURL
+	if iconURL == "" {
+		iconURL = sc.iconURL
+	}
+	iconEmoji := msg.IconEmoji
+	if iconEmoji == "" {
+		iconEmoji = sc.iconEmoji
+	}
+	if iconURL != "" {
+		payload["icon_url"] = iconURL
+	} else if iconEmoji != "" {
+		payload["icon_emoji"] = iconEmoji
+	}
+
 	return sc.callSlackAPI(ctx, "https://slack.com/api/chat.postMessage", payload)
 }
 

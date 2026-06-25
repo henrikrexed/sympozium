@@ -40,7 +40,32 @@ For reliable Slack connectivity, configure your Slack app with both tokens and r
     - `message.im`
     - `message.channels`
     - `app_mention`
+- Add bot token (OAuth) scopes:
+    - `chat:write` — post replies
+    - `reactions:write` — add the acknowledgement reactions
+    - `app_mentions:read`, `channels:history`, `im:history` — read the events above
+    - `chat:write.customize` — **optional**, only needed for per-agent sender attribution (see below)
 - Reinstall the app after changing scopes or event subscriptions
 
 !!! warning
     If `SLACK_APP_TOKEN` is omitted, Sympozium falls back to Slack Events API mode, which requires a publicly reachable webhook URL.
+
+### Per-agent sender attribution (optional)
+
+In a multi-agent Ensemble, each persona runs as its own Slack channel pod (it
+knows which agent it is via `INSTANCE_NAME`). By default every pod posts under
+the single bot identity. To make each persona's replies appear under its own
+display name and icon, set these env vars on the persona's Slack pod:
+
+| Env var | Maps to `chat.postMessage` | Example |
+|---------|----------------------------|---------|
+| `SLACK_DISPLAY_NAME` | `username` | `Winston (Architect)` |
+| `SLACK_ICON_URL` | `icon_url` | `https://example.com/winston.png` |
+| `SLACK_ICON_EMOJI` | `icon_emoji` | `:bricks:` |
+
+`icon_url` and `icon_emoji` are mutually exclusive — a URL wins if both are set.
+This requires the **`chat:write.customize`** bot scope. The fields are also
+exposed on `channel.OutboundMessage` (`username` / `iconUrl` / `iconEmoji`) so a
+caller can override the identity per message. When none of them are set the
+`chat.postMessage` payload is identical to a plain single-identity bot post, so
+existing setups are unaffected.
