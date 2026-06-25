@@ -1428,6 +1428,12 @@ func (r *EnsembleReconciler) deliverStimulus(ctx context.Context, log logr.Logge
 				"sympozium.ai/stimulus":       "true",
 				"sympozium.ai/trigger-source": triggerSource,
 			},
+			// Carry channel reply-routing annotations forward (ISI-1442) when the
+			// Ensemble itself carries a reply target (e.g. stamped from the
+			// inbound that provisioned it), so stimulus output can be routed back
+			// to the originating Slack channel/thread. Absent on a plain
+			// readiness-triggered stimulus, leaving the child annotation-free.
+			Annotations: propagateReplyAnnotations(nil, pack.Annotations),
 		},
 		Spec: sympoziumv1alpha1.AgentRunSpec{
 			AgentRef: targetAgentName,
