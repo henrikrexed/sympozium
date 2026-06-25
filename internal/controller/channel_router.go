@@ -34,19 +34,29 @@ type ChannelRouter struct {
 	Log      logr.Logger
 }
 
+// channelRouterGroup is the durable queue-group name for ChannelRouter's inbound
+// subscriptions. Replicas of this router share it (and thus load-balance); other
+// logical subscribers to the same topics use their own group and are unaffected.
+const channelRouterGroup = "channel-router"
+
 // Start begins listening for inbound channel messages and completed agent runs.
 // It blocks until ctx is cancelled.
 func (cr *ChannelRouter) Start(ctx context.Context) error {
 	cr.Log.Info("Starting channel message router")
 
-	// Subscribe to inbound channel messages.
-	inboundCh, err := cr.EventBus.Subscribe(ctx, eventbus.TopicChannelMessageRecv)
+	// Subscribe via a durable queue group so that, should the controller ever run
+	// with replicas>1 without leader election, ChannelRouter instances load-balance
+	// inbound events instead of every replica receiving every event and re-creating
+	// the same AgentRun (ISI-1430).
+	inboundCh, err := cr.EventBus.SubscribeGroup(ctx, eventbus.TopicChannelMessageRecv, channelRouterGroup)
 	if err != nil {
 		return fmt.Errorf("subscribing to %s: %w", eventbus.TopicChannelMessageRecv, err)
 	}
 
-	// Subscribe to completed agent runs to route responses back.
-	completedCh, err := cr.EventBus.Subscribe(ctx, eventbus.TopicAgentRunCompleted)
+	// Subscribe to completed agent runs to route responses back. Same queue group:
+	// a distinct group from spawn-router / web proxies, so each of those still
+	// receives its own copy of every completed run.
+	completedCh, err := cr.EventBus.SubscribeGroup(ctx, eventbus.TopicAgentRunCompleted, channelRouterGroup)
 	if err != nil {
 		return fmt.Errorf("subscribing to %s: %w", eventbus.TopicAgentRunCompleted, err)
 	}

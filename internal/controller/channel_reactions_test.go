@@ -35,6 +35,9 @@ func (r *recordingEventBus) Publish(_ context.Context, topic string, event *even
 func (r *recordingEventBus) Subscribe(_ context.Context, _ string) (<-chan *eventbus.Event, error) {
 	return nil, nil
 }
+func (r *recordingEventBus) SubscribeGroup(_ context.Context, _, _ string) (<-chan *eventbus.Event, error) {
+	return nil, nil
+}
 func (r *recordingEventBus) Close() error { return nil }
 
 func slackInstance(opts *sympoziumv1alpha1.SlackChannelOptions) *sympoziumv1alpha1.Agent {
