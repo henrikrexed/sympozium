@@ -281,15 +281,17 @@ func (sc *SlackChannel) readSocketMode(ctx context.Context, conn *websocket.Conn
 // The payload wraps an Events API envelope with type "event_callback".
 func (sc *SlackChannel) handleSocketEvent(ctx context.Context, payload json.RawMessage) {
 	var inner struct {
-		Type  string `json:"type"`
-		Event struct {
-			Type     string `json:"type"`
-			User     string `json:"user"`
-			Text     string `json:"text"`
-			Channel  string `json:"channel"`
-			TS       string `json:"ts"`
-			ThreadTS string `json:"thread_ts"`
-			BotID    string `json:"bot_id"`
+		Type    string `json:"type"`
+		EventID string `json:"event_id"`
+		Event   struct {
+			Type        string `json:"type"`
+			User        string `json:"user"`
+			Text        string `json:"text"`
+			Channel     string `json:"channel"`
+			TS          string `json:"ts"`
+			ThreadTS    string `json:"thread_ts"`
+			BotID       string `json:"bot_id"`
+			ClientMsgID string `json:"client_msg_id"`
 		} `json:"event"`
 	}
 	if err := json.Unmarshal(payload, &inner); err != nil {
@@ -323,6 +325,13 @@ func (sc *SlackChannel) handleSocketEvent(ctx context.Context, payload json.RawM
 		Text:     inner.Event.Text,
 		Metadata: map[string]string{
 			"ts": inner.Event.TS,
+			// Slack idempotency keys for inbound dedup (ISI-1427). The same
+			// event_callback can reach the control plane more than once —
+			// Slack retries unacked events, and a shared-app Ensemble keeps
+			// multiple Socket Mode connections that Slack may each deliver to.
+			// The router dedups on these so one Slack message yields one run.
+			"slackEventId":     inner.EventID,
+			"slackClientMsgId": inner.Event.ClientMsgID,
 		},
 	}
 
@@ -384,14 +393,16 @@ func (sc *SlackChannel) handleSlackEvents(w http.ResponseWriter, r *http.Request
 	var envelope struct {
 		Type      string `json:"type"`
 		Challenge string `json:"challenge"`
+		EventID   string `json:"event_id"`
 		Event     struct {
-			Type     string `json:"type"`
-			User     string `json:"user"`
-			Text     string `json:"text"`
-			Channel  string `json:"channel"`
-			TS       string `json:"ts"`
-			ThreadTS string `json:"thread_ts"`
-			BotID    string `json:"bot_id"`
+			Type        string `json:"type"`
+			User        string `json:"user"`
+			Text        string `json:"text"`
+			Channel     string `json:"channel"`
+			TS          string `json:"ts"`
+			ThreadTS    string `json:"thread_ts"`
+			BotID       string `json:"bot_id"`
+			ClientMsgID string `json:"client_msg_id"`
 		} `json:"event"`
 	}
 
@@ -426,6 +437,9 @@ func (sc *SlackChannel) handleSlackEvents(w http.ResponseWriter, r *http.Request
 			Text:     envelope.Event.Text,
 			Metadata: map[string]string{
 				"ts": envelope.Event.TS,
+				// Slack idempotency keys for inbound dedup (ISI-1427).
+				"slackEventId":     envelope.EventID,
+				"slackClientMsgId": envelope.Event.ClientMsgID,
 			},
 		}
 
