@@ -27,6 +27,31 @@ func TestNormalizeSidecarTarget(t *testing.T) {
 	}
 }
 
+// TestExtractSkillTarget locks in the skill.name resolution used for per-skill
+// observability stats (ISI-1461): the target field is parsed and normalized the
+// same way as routing, so casing/whitespace variants collapse to one series, and
+// absent/blank targets fall back to the stable "command-executor" label.
+func TestExtractSkillTarget(t *testing.T) {
+	cases := []struct {
+		name, argsJSON, want string
+	}{
+		{"plain target", `{"command":"gh pr list","target":"github-gitops"}`, "github-gitops"},
+		{"mixed case normalized", `{"command":"gh pr list","target":"Github-Gitops"}`, "github-gitops"},
+		{"whitespace normalized", `{"command":"kubectl get po","target":"  k8s-ops\n"}`, "k8s-ops"},
+		{"empty target falls back", `{"command":"echo hi","target":""}`, "command-executor"},
+		{"absent target falls back", `{"command":"echo hi"}`, "command-executor"},
+		{"invalid json falls back", `not json`, "command-executor"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := extractSkillTarget(c.argsJSON)
+			if got != c.want {
+				t.Fatalf("extractSkillTarget(%q) = %q, want %q", c.argsJSON, got, c.want)
+			}
+		})
+	}
+}
+
 // TestExecRequestJSONIncludesTarget locks in the IPC protocol contract: when
 // Target is set, the JSON payload written to /ipc/tools/exec-request-*.json
 // MUST contain a top-level "target" field with the literal string value. The

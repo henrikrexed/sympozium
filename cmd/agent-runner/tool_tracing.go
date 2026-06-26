@@ -12,14 +12,21 @@ import (
 )
 
 // extractSkillTarget parses the "target" field from an execute_command args
-// JSON blob. Returns "command-executor" when the field is absent or blank so
-// callers always get a non-empty label.
+// JSON blob and normalizes it the same way the routing path does
+// (normalizeSidecarTarget: trim + lowercase) so the skill.name span/metric
+// dimension matches the actual sidecar routing key. Without this, casing
+// variants emitted by the LLM ("Github-Gitops" vs "github-gitops") would
+// fan out into distinct series in Dynatrace and break per-skill aggregation.
+// Returns "command-executor" when the field is absent or blank so callers
+// always get a non-empty label.
 func extractSkillTarget(argsJSON string) string {
 	var args struct {
 		Target string `json:"target"`
 	}
-	if err := json.Unmarshal([]byte(argsJSON), &args); err == nil && args.Target != "" {
-		return args.Target
+	if err := json.Unmarshal([]byte(argsJSON), &args); err == nil {
+		if t := normalizeSidecarTarget(args.Target); t != "" {
+			return t
+		}
 	}
 	return "command-executor"
 }
