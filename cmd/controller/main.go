@@ -207,12 +207,20 @@ func main() {
 		natsURL = os.Getenv("NATS_URL")
 	}
 	if natsURL != "" {
-		eb, err := eventbus.NewNATSEventBus(natsURL)
+		// NewNATSEventBus is resilient: it uses infinite reconnect and retries
+		// JetStream stream creation in the background, so a transient broker
+		// outage at boot can no longer permanently disable channel routing
+		// (ISI-1466). An error here means an unrecoverable config problem
+		// (e.g. a malformed URL), so failing fast is correct.
+		eb, err := eventbus.NewNATSEventBus(natsURL, eventbus.WithLogger(ctrl.Log.WithName("eventbus")))
 		if err != nil {
-			setupLog.Error(err, "unable to connect to NATS — channel routing disabled")
+			setupLog.Error(err, "invalid NATS configuration — channel routing disabled")
 		} else {
 			agentRunReconciler.EventBus = eb
 			ensembleReconciler.EventBus = eb
+
+			// Surface bus health so an outage is visible instead of silent.
+			metrics.Registry.MustRegister(eb.Collectors()...)
 
 			router := &controller.ChannelRouter{
 				Client:   mgr.GetClient(),
