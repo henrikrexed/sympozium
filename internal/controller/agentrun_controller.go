@@ -56,6 +56,46 @@ var (
 	agentDurationHist, _ = controllerMeter.Float64Histogram("sympozium.agent.duration_ms", metric.WithUnit("ms"), metric.WithDescription("Agent run duration"))
 	controllerErrors, _  = controllerMeter.Int64Counter("sympozium.errors", metric.WithUnit("{error}"), metric.WithDescription("Errors encountered"))
 
+	// handoffLatency measures the wall-clock gap between one phase completing
+	// and its successor being created, labelled lane=sequential|delegation and
+	// from/to (persona names — bounded cardinality) so a dashboard can spot a
+	// slow handoff. Recorded at both the sequential and delegation successor
+	// sites below.
+	handoffLatency, _ = controllerMeter.Float64Histogram("sympozium.handoff.latency_ms",
+		metric.WithUnit("ms"), metric.WithDescription("Latency between a phase completing and its successor starting"))
+
+	// Delegation-executor instruments (ISI-1463 / ISI-1462 Phase-3). The
+	// delegation lane previously emitted zero telemetry, so once the guardrails
+	// (concurrency/depth/condition caps) are enabled there was no way to prove
+	// they hold. All additive, low cardinality (persona/ensemble names are a
+	// bounded set), recorded inside triggerDelegationSuccessors.
+
+	// delegationEdges counts per-edge delegation decisions. decision lets a
+	// dashboard separate fired edges from each skip reason, so "the cap engaged"
+	// (skipped_inflight_cap>0) and "condition-aware routing works" (fired<=K) are
+	// directly queryable rather than inferred from run inventory.
+	delegationEdges, _ = controllerMeter.Int64Counter("sympozium.delegation.edges",
+		metric.WithUnit("{edge}"), metric.WithDescription("Delegation edge decisions by outcome (fired/skipped_*)"))
+
+	// delegationInflightAtDecision records the per-ensemble in-flight run count at
+	// the moment the concurrency cap is evaluated. A histogram (not an
+	// UpDownCounter gauge) so controller restarts/replicas can't double-count;
+	// max() over it proves in-flight never exceeded DelegationMaxInflight.
+	delegationInflightAtDecision, _ = controllerMeter.Int64Histogram("sympozium.delegation.inflight_at_decision",
+		metric.WithUnit("{run}"), metric.WithDescription("Per-ensemble non-terminal run count at delegation decision time"))
+
+	// delegationDepthObserved records the depth stamped on spawned delegation
+	// children; max() proves no child exceeds DelegationMaxDepth.
+	delegationDepthObserved, _ = controllerMeter.Int64Histogram("sympozium.delegation.depth_observed",
+		metric.WithUnit("{hop}"), metric.WithDescription("Delegation depth of controller-spawned children"))
+
+	// delegationToolEmitted counts the delegations the model itself emitted
+	// (len(Status.Delegates)) at evaluation time. Compared against fired edges it
+	// quantifies model under-emission vs executor backfill (the ISI-1462 root
+	// cause: qwen3.6 emits 1 of N edges then stalls).
+	delegationToolEmitted, _ = controllerMeter.Int64Counter("sympozium.delegation.tool_emitted",
+		metric.WithUnit("{delegation}"), metric.WithDescription("Model-emitted delegations observed on the source run"))
+
 	// Web endpoint server-mode metrics.
 	webEndpointServing, _         = controllerMeter.Int64UpDownCounter("sympozium.web_endpoint.serving", metric.WithUnit("{deployment}"), metric.WithDescription("Active server-mode Deployments"))
 	webEndpointGatewayNotReady, _ = controllerMeter.Int64Counter("sympozium.web_endpoint.gateway_not_ready", metric.WithUnit("{check}"), metric.WithDescription("Gateway check failures"))
@@ -1084,6 +1124,20 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 		}
 		log.Info("Created sequential successor run", "run", runName, "target", targetPersona)
 		triggered = true
+
+		// Handoff latency: the dead time between the predecessor completing and
+		// this successor being created. from/to are persona names (bounded
+		// cardinality) so a dashboard can spot a slow handoff. lane=sequential
+		// distinguishes it from the delegation lane below.
+		if agentRun.Status.CompletedAt != nil {
+			gapMs := time.Since(agentRun.Status.CompletedAt.Time).Milliseconds()
+			handoffLatency.Record(ctx, float64(gapMs), metric.WithAttributes(
+				attribute.String("lane", "sequential"),
+				attribute.String("from", sourcePersona),
+				attribute.String("to", targetPersona),
+				attribute.String("sympozium.ensemble", ensembleName),
+			))
+		}
 	}
 
 	// Mark this run as having triggered its successors to prevent duplicates.
@@ -1152,14 +1206,37 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 	// does not fire further delegation successors, so a controller-driven chain
 	// cannot cascade unbounded. The originating run carries no depth label
 	// (depth 0); each spawned child is stamped depth+1 below.
+	// recordEdge emits an I2 edge-decision data point (low cardinality: a fixed
+	// decision enum × bounded persona/ensemble names). Captured here so each skip
+	// and fire site stays a one-liner.
+	recordEdge := func(decision string, n int) {
+		if n <= 0 {
+			return
+		}
+		delegationEdges.Add(ctx, int64(n), metric.WithAttributes(
+			attribute.String("decision", decision),
+			attribute.String("ensemble", ensembleName),
+			attribute.String("source", sourcePersona),
+		))
+	}
+
 	depth := delegationDepth(agentRun)
 	maxDepth := r.delegationMaxDepth()
 	if depth >= maxDepth {
 		log.Info("Skipping delegation — at/over depth cap",
 			"source", sourcePersona, "ensemble", ensembleName,
 			"depth", depth, "maxDepth", maxDepth)
+		recordEdge("skipped_depth_cap", 1)
 		return ctrl.Result{}, nil
 	}
+
+	// I5 (tool-emit / under-emission signal): how many delegations the model
+	// itself emitted on this run. Compared against fired edges downstream it
+	// quantifies qwen3.6 under-emission vs executor backfill.
+	delegationToolEmitted.Add(ctx, int64(len(agentRun.Status.Delegates)), metric.WithAttributes(
+		attribute.String("ensemble", ensembleName),
+		attribute.String("source", sourcePersona),
+	))
 
 	// Build a set of personas the model already delegated to at runtime so the
 	// executor stays a pure fallback and never double-spawns those targets.
@@ -1180,11 +1257,13 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		if !delegationEdgeActive(rel.Condition) {
 			log.Info("Skipping delegation edge — condition not met for success",
 				"source", sourcePersona, "target", rel.Target, "condition", rel.Condition)
+			recordEdge("skipped_condition", 1)
 			continue
 		}
 		if alreadyDelegated[rel.Target] {
 			log.Info("Skipping delegation edge — model already delegated to target at runtime",
 				"source", sourcePersona, "target", rel.Target)
+			recordEdge("skipped_already_delegated", 1)
 			continue
 		}
 		candidates = append(candidates, rel)
@@ -1197,6 +1276,10 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 	// candidate is always fired (no fan-out risk); when several compete and none
 	// matches the result, we fan out to none rather than run the whole team.
 	selected := selectDelegationEdges(candidates, agentRun.Status.Result, agentRun.Spec.Task, defaultDelegationTopK)
+	// Candidates that condition-aware selection did not pick were dropped on
+	// condition match — count them so the dashboard can prove routing narrowed the
+	// fan-out (e.g. cto's 9 active edges → 1 fired, 8 skipped_condition).
+	recordEdge("skipped_condition", len(candidates)-len(selected))
 	if len(selected) == 0 {
 		if len(candidates) > 0 {
 			log.Info("No delegation edge matched the run result — skipping (no fan-out)",
@@ -1218,9 +1301,18 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 			"ensemble", ensembleName)
 		return ctrl.Result{RequeueAfter: delegationRequeueInterval}, nil
 	}
+	// I3: record the in-flight count we already computed for the cap, at decision
+	// time, as a histogram (restart-safe — no gauge state to double-count). max()
+	// over this proves the concurrency cap held.
+	delegationInflightAtDecision.Record(ctx, int64(inflight), metric.WithAttributes(
+		attribute.String("ensemble", ensembleName),
+	))
 	if inflight >= maxInflight {
 		log.Info("Delegation in-flight cap reached — requeueing",
 			"ensemble", ensembleName, "inflight", inflight, "maxInflight", maxInflight)
+		// The selected (≤K) edges were deferred, not dropped — count them so a
+		// nonzero skipped_inflight_cap proves the cap engaged (vs gridlock).
+		recordEdge("skipped_inflight_cap", len(selected))
 		return ctrl.Result{RequeueAfter: delegationRequeueInterval}, nil
 	}
 
@@ -1309,6 +1401,26 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		}
 		log.Info("Created delegation successor run", "run", runName, "target", targetPersona)
 		triggered = true
+
+		// I2 fired + I4 depth: a real spawn at childDepth. max(depth_observed)
+		// proves no child exceeds DelegationMaxDepth.
+		recordEdge("fired", 1)
+		delegationDepthObserved.Record(ctx, int64(childDepth), metric.WithAttributes(
+			attribute.String("ensemble", ensembleName),
+		))
+
+		// I1: delegation-lane handoff latency — the dead time between the source
+		// completing and this successor being created. Mirrors the sequential site
+		// with lane=delegation so the two lanes are separable in one histogram.
+		if agentRun.Status.CompletedAt != nil {
+			gapMs := time.Since(agentRun.Status.CompletedAt.Time).Milliseconds()
+			handoffLatency.Record(ctx, float64(gapMs), metric.WithAttributes(
+				attribute.String("lane", "delegation"),
+				attribute.String("from", sourcePersona),
+				attribute.String("to", targetPersona),
+				attribute.String("sympozium.ensemble", ensembleName),
+			))
+		}
 	}
 
 	// Mark this run as having triggered its delegations to prevent duplicates.

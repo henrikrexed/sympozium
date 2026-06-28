@@ -56,6 +56,43 @@ the new `(ctrl.Result, error)` signature). Added:
 `go build`, `go vet`, full `internal/controller` package test, and `helm template`
 (caps emitted only with executor on) all green.
 
+## Observability instrumentation (ISI-1462 Phase-3 handoff)
+
+The delegation lane previously emitted **zero** telemetry, so once the caps are enabled
+there would be no way to prove they hold. Per the obs handoff (`docs/ISI-1462-phase3-delegation-autonomy-observability.md`),
+the following were added inside `triggerDelegationSuccessors` while the code was open
+(all additive, low cardinality, mirroring `sympozium.*` conventions):
+
+- **I1** — `sympozium.handoff.latency_ms` now recorded in the delegation path with
+  `lane=delegation`; the existing sequential site is tagged `lane=sequential` so the two
+  lanes are separable in one histogram.
+- **I2** — `sympozium.delegation.edges` counter, attr `decision` ∈
+  {`fired`, `skipped_condition`, `skipped_already_delegated`, `skipped_inflight_cap`,
+  `skipped_depth_cap`}, `ensemble`, `source`. A nonzero `skipped_inflight_cap`/`skipped_depth_cap`
+  proves the cap *engaged*; `fired ≤ K` proves condition-aware routing (no 9-wide fan-out).
+- **I3** — `sympozium.delegation.inflight_at_decision` histogram (`ensemble`) — the in-flight
+  count already Listed for the concurrency cap, recorded at decision time. Histogram (not a
+  gauge) so restarts/replicas can't double-count; `max() ≤ DelegationMaxInflight` proves the cap.
+- **I4** — `sympozium.delegation.depth_observed` histogram (`ensemble`) — depth stamped on
+  spawned children; `max() ≤ DelegationMaxDepth`.
+- **I5** — `sympozium.delegation.tool_emitted` counter (`ensemble`, `source`) —
+  `len(Status.Delegates)`, to quantify model under-emission vs executor backfill.
+
+**Naming note for obs:** the new I2–I5 metrics use the bare `ensemble` attribute (matches the
+Phase-3 DQL K2–K5). I1 keeps the existing handoff site's `sympozium.ensemble` attribute to avoid
+breaking in-prod sequential dashboards; the Phase-3 K1 query groups by `lane`/`from`/`to` only,
+so it is unaffected.
+
+**Emission cadence caveat:** runs that pass the guards but fire nothing (no condition match) are
+not marked `delegation-triggered`, and the in-flight-cap path returns `RequeueAfter`. Both re-run
+on re-reconcile, so I3/I5 and the skip counters may re-record across reconciles. The Phase-3
+queries use `max()` (I3/I4, idempotent to repeats) and rate/sum trends (I2/I5), so the cap-holds
+assertions are robust to this; absolute counter totals should be read as trends, not exact tallies.
+
+Verified by `agentrun_delegation_metrics_test.go` (`..._EmitsEdgeDecisionMetrics`): an SDK
+manual-reader harness asserts the cto fan-out records `edges{decision=fired}=1` and
+`edges{decision=skipped_condition}=2`.
+
 ## Deploy gate
 
 Enabling autonomous delegation is a behavior change with prior-gridlock history.
