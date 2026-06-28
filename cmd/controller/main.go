@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"os"
+	"strconv"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -46,6 +47,8 @@ func main() {
 	var natsURL string
 	var maxRunHistory int
 	var delegationControllerExecutor bool
+	var delegationMaxInflight int
+	var delegationMaxDepth int
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -60,6 +63,15 @@ func main() {
 			"models that never emit the delegate_to_persona tool. Default off; the "+
 			"tool-driven delegation path is unchanged. Also enabled via "+
 			"SYMPOZIUM_DELEGATION_CONTROLLER_EXECUTOR=true.")
+	flag.IntVar(&delegationMaxInflight, "delegation-max-inflight", 0,
+		"Per-ensemble in-flight cap for the controller-side delegation executor: "+
+			"when an ensemble has this many non-terminal AgentRuns, successors are "+
+			"requeued instead of spawned. 0 uses the built-in default. Also set via "+
+			"SYMPOZIUM_DELEGATION_MAX_INFLIGHT.")
+	flag.IntVar(&delegationMaxDepth, "delegation-max-depth", 0,
+		"Depth cap for controller-spawned delegation chains: a delegation child "+
+			"at/over this depth fires no further delegation successors. 0 uses the "+
+			"built-in default. Also set via SYMPOZIUM_DELEGATION_MAX_DEPTH.")
 	flag.Parse()
 
 	// Resolve the image tag used for runtime-spawned pods (agent-runner,
@@ -84,6 +96,24 @@ func main() {
 	// flips it on.
 	if os.Getenv("SYMPOZIUM_DELEGATION_CONTROLLER_EXECUTOR") == "true" {
 		delegationControllerExecutor = true
+	}
+
+	// Guardrail caps (ISI-1463) mirror the same env-override pattern so the Helm
+	// chart can tune them without CLI flags. Invalid/empty/non-positive values
+	// fall through to the controller's built-in defaults.
+	if v := os.Getenv("SYMPOZIUM_DELEGATION_MAX_INFLIGHT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			delegationMaxInflight = n
+		} else {
+			setupLog.Info("Ignoring invalid SYMPOZIUM_DELEGATION_MAX_INFLIGHT", "value", v)
+		}
+	}
+	if v := os.Getenv("SYMPOZIUM_DELEGATION_MAX_DEPTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			delegationMaxDepth = n
+		} else {
+			setupLog.Info("Ignoring invalid SYMPOZIUM_DELEGATION_MAX_DEPTH", "value", v)
+		}
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
@@ -159,6 +189,8 @@ func main() {
 		ImageTag:                     imageTag,
 		RunHistoryLimit:              maxRunHistory,
 		DelegationControllerExecutor: delegationControllerExecutor,
+		DelegationMaxInflight:        delegationMaxInflight,
+		DelegationMaxDepth:           delegationMaxDepth,
 		DynamicClient:                dynamicClient,
 	}
 	if err := agentRunReconciler.SetupWithManager(mgr); err != nil {

@@ -355,6 +355,17 @@ delegation:
   # emit the delegate_to_persona tool call. Default false: the tool-driven
   # delegation path remains authoritative and behavior is unchanged when off.
   controllerExecutor: false
+  # -- Primary blast-radius guardrail (ISI-1463). Max non-terminal AgentRuns per
+  # ensemble before the executor requeues a successor instead of spawning it.
+  # Bounds delegation fan-out regardless of graph shape, preventing the ISI-1458
+  # gridlock. 0 uses the controller default (3). Only effective when
+  # controllerExecutor is true.
+  maxInflight: 3
+  # -- Depth cap (ISI-1463) for controller-spawned delegation chains. A
+  # delegation child at/over this depth fires no further delegation successors,
+  # preventing unbounded cascade. 0 uses the controller default (1). Only
+  # effective when controllerExecutor is true.
+  maxDepth: 1
 
 # -- Cluster-local inference models.
 # Each item creates a Model CR that the controller reconciles into
