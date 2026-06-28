@@ -1,0 +1,101 @@
+package eventbus
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+)
+
+// newTestBus builds a NATSEventBus with just the state needed to exercise the
+// readiness/publish/metric logic, without a live NATS connection.
+func newTestBus() *NATSEventBus {
+	return &NATSEventBus{
+		readyCh:   make(chan struct{}),
+		connected: newConnectedGauge(),
+	}
+}
+
+func gaugeValue(g prometheus.Gauge) float64 {
+	var m dto.Metric
+	if err := g.Write(&m); err != nil {
+		return -1
+	}
+	return m.GetGauge().GetValue()
+}
+
+// ISI-1466: publishing before the bus is ready must return an error rather than
+// silently dropping the event or panicking on a nil JetStream handle.
+func TestPublishReturnsErrorWhenNotReady(t *testing.T) {
+	n := newTestBus()
+
+	err := n.Publish(context.Background(), TopicChannelMessageRecv, &Event{Topic: TopicChannelMessageRecv})
+	if err == nil {
+		t.Fatal("expected error when publishing before bus is ready, got nil")
+	}
+}
+
+// ISI-1466: waitReady must unblock immediately once the stream becomes ready.
+func TestWaitReadyUnblocksWhenReady(t *testing.T) {
+	n := newTestBus()
+
+	go func() {
+		// Simulate ensureStreamOnce marking the bus ready.
+		n.ready.Store(true)
+		close(n.readyCh)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := n.waitReady(ctx); err != nil {
+		t.Fatalf("waitReady returned error after becoming ready: %v", err)
+	}
+}
+
+// ISI-1466: a consumer waiting for readiness must abort cleanly when its context
+// is cancelled (e.g. controller shutdown) rather than blocking forever.
+func TestWaitReadyRespectsContextCancellation(t *testing.T) {
+	n := newTestBus()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := n.waitReady(ctx); err == nil {
+		t.Fatal("expected context cancellation error from waitReady, got nil")
+	}
+}
+
+// The connected gauge must default to 0 (down) and reflect setConnected.
+func TestConnectedGaugeReflectsState(t *testing.T) {
+	n := newTestBus()
+
+	if got := gaugeValue(n.connected); got != 0 {
+		t.Fatalf("expected connected gauge to default to 0, got %v", got)
+	}
+
+	n.setConnected(true)
+	if got := gaugeValue(n.connected); got != 1 {
+		t.Fatalf("expected connected gauge to be 1 after setConnected(true), got %v", got)
+	}
+
+	n.setConnected(false)
+	if got := gaugeValue(n.connected); got != 0 {
+		t.Fatalf("expected connected gauge to be 0 after setConnected(false), got %v", got)
+	}
+}
+
+// Collectors must expose the connected gauge so the controller can register it.
+func TestCollectorsExposesConnectedGauge(t *testing.T) {
+	n := newTestBus()
+	cols := n.Collectors()
+	if len(cols) == 0 {
+		t.Fatal("expected at least one collector from Collectors()")
+	}
+
+	reg := prometheus.NewRegistry()
+	if err := reg.Register(cols[0]); err != nil {
+		t.Fatalf("failed to register collector: %v", err)
+	}
+}
