@@ -114,6 +114,34 @@ New tests: `TestConsumerLostClassification`, `TestStartHealerGuardIsReArmable`.
 ready (not only during boot) and confirm the stream re-creates and routing
 resumes — this exercises the M1 post-boot path, not just the boot path.
 
+## Post-drill hardening (ISI-1469 residual — child 25d47671)
+
+ProxOps deployed `isi1406-f4dd85c` and confirmed the boot-blip and the realistic
+(persistent-PVC) NATS-bounce paths recover with no controller restart. The
+*full-store-loss* drill (wiping the JetStream store so NATS returns empty)
+surfaced a residual gap: **M1 re-creates the stream and the gauge returns to 1,
+but a running subscriber did not re-establish its JetStream consumer** — the
+stream showed 0 consumers and a probe sat undelivered until a controller restart.
+
+Root cause: a deleted-and-recreated stream leaves the old ephemeral consumer
+gone, but `Fetch` against the stale handle fails with a no-responders/timeout
+error — *not* `ErrConsumerNotFound` — so the `consumerLost`-only recovery never
+re-subscribed. (Low risk on observable-llm, which uses a persistent PVC; it
+matters for ephemeral/`emptyDir` NATS, which is exactly the M1 target.)
+
+**Fix:** track a `streamGen` counter bumped only when a *genuinely new* stream is
+established, detected by comparing the stream's `Created` timestamp from the
+CreateOrUpdate response (`streamRecreated`). A normal reconnect where the stream
+survives keeps the same timestamp and does **not** bump the generation, so
+transient blips still don't churn/leak consumers (preserves M2). The Subscribe
+fetch loop now re-establishes its consumer when `consumerLost(err)` **or** the
+generation advanced since the consumer was created — so a full stream re-heal
+re-subscribes the running router automatically, no restart.
+
+New test: `TestStreamRecreatedDetection`. The ephemeral-NATS full-store-loss
+path should be re-drilled by ProxOps to confirm consumers re-establish live
+(tracked in child `25d47671`).
+
 ## Handoff
 
 - **Code review:** Code Reviewer (Amelia) — adversarial review of the

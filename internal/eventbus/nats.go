@@ -53,11 +53,20 @@ type NATSEventBus struct {
 	js   jetstream.JetStream
 	log  logr.Logger
 
-	mu     sync.RWMutex
-	stream jetstream.Stream
+	mu                sync.RWMutex
+	stream            jetstream.Stream
+	lastStreamCreated time.Time // Created timestamp of the last-seen stream (guarded by mu)
 
 	ready   atomic.Bool
 	readyCh chan struct{} // closed once the stream is first ready
+
+	// streamGen increments whenever a *new* JetStream stream is established
+	// (e.g. NATS came back with empty storage and the stream was recreated).
+	// Subscribers compare it against the generation their consumer was created
+	// under and re-establish the consumer when it changes (ISI-1466 residual /
+	// child 25d47671). A normal reconnect where the stream survives does NOT
+	// bump it, so transient blips don't churn consumers.
+	streamGen atomic.Uint64
 
 	healing atomic.Bool // true while a background streamHealer is running
 
@@ -173,7 +182,23 @@ func (n *NATSEventBus) ensureStreamOnce() (jetstream.Stream, error) {
 		return nil, err
 	}
 
+	// Detect whether this is a genuinely new stream (NATS returned with empty
+	// storage, or the stream was deleted and recreated). The Created timestamp
+	// comes from the CreateOrUpdate response, so this costs no extra round-trip.
+	var created time.Time
+	if info := stream.CachedInfo(); info != nil {
+		created = info.Created
+	}
+
 	n.mu.Lock()
+	if streamRecreated(n.lastStreamCreated, created) {
+		n.streamGen.Add(1)
+		n.log.Info("JetStream stream was re-created — subscribers will re-establish consumers",
+			"created", created)
+	}
+	if !created.IsZero() {
+		n.lastStreamCreated = created
+	}
 	n.stream = stream
 	n.mu.Unlock()
 	n.setConnected(true)
@@ -254,6 +279,15 @@ func consumerLost(err error) bool {
 		errors.Is(err, jetstream.ErrConsumerDoesNotExist)
 }
 
+// streamRecreated reports whether a freshly observed stream-created timestamp
+// indicates a different stream than the one last seen — i.e. the stream was
+// deleted and recreated (NATS came back with empty storage). It returns false
+// on first observation (last is zero) and when either timestamp is unavailable,
+// so we never bump the generation spuriously.
+func streamRecreated(last, current time.Time) bool {
+	return !last.IsZero() && !current.IsZero() && !current.Equal(last)
+}
+
 // Collectors returns Prometheus collectors that expose the bus health so the
 // outage is visible (instead of silent). Register them with the controller's
 // metrics registry.
@@ -301,8 +335,10 @@ func (n *NATSEventBus) Publish(ctx context.Context, topic string, event *Event) 
 // Subscribe returns a channel that receives events for the given topic.
 //
 // It blocks until the stream is ready (or ctx is cancelled). The internal fetch
-// loop tolerates transient broker outages and re-creates its consumer if it is
-// lost across a reconnect, so subscribers recover without a process restart.
+// loop tolerates transient broker outages and re-establishes its consumer when
+// it is lost across a reconnect — or when the stream itself is recreated under
+// it (NATS returning with empty storage) — so subscribers recover without a
+// process restart.
 //
 // Note: because it blocks until NATS is reachable, callers should run Subscribe
 // inside a ctx-cancellable goroutine/Runnable (as all current call sites do); a
@@ -324,6 +360,10 @@ func (n *NATSEventBus) Subscribe(ctx context.Context, topic string) (<-chan *Eve
 	if err != nil {
 		return nil, fmt.Errorf("creating consumer for %s: %w", subject, err)
 	}
+	// Generation the current consumer was created under. If the stream is
+	// recreated (streamGen advances), this consumer is stale and must be
+	// re-established even though the fetch error won't be ErrConsumerNotFound.
+	myGen := n.streamGen.Load()
 
 	ch := make(chan *Event, 64)
 
@@ -346,21 +386,27 @@ func (n *NATSEventBus) Subscribe(ctx context.Context, topic string) (<-chan *Eve
 				if werr := n.waitReady(ctx); werr != nil {
 					return
 				}
-				// Only re-create the consumer when it was actually lost (reaped
-				// across a reconnect). Re-creating on *every* fetch error would
-				// mint a fresh ephemeral consumer each iteration, leaking the
-				// prior one server-side until InactiveThreshold reaps it
-				// (ISI-1468 M2). Other fetch errors (transient connection blips)
-				// leave the connection-bound consumer handle valid, so we just
-				// back off and retry it.
-				if consumerLost(err) {
+				// Re-create the consumer when it was actually lost (reaped across
+				// a reconnect) OR when the stream was recreated under us (streamGen
+				// advanced — e.g. NATS came back with empty storage, which surfaces
+				// as a no-responders/timeout error rather than ErrConsumerNotFound,
+				// so the running subscriber would otherwise spin forever on a stale
+				// handle: ISI-1466 residual / child 25d47671). We do NOT re-create
+				// on *every* fetch error, since that would mint a fresh ephemeral
+				// consumer each iteration and leak the prior one server-side until
+				// InactiveThreshold reaps it (ISI-1468 M2); a transient connection
+				// blip leaves the connection-bound handle valid, so we just back
+				// off and retry it.
+				if consumerLost(err) || n.streamGen.Load() != myGen {
 					if newConsumer, cerr := n.createConsumer(ctx, subject); cerr == nil {
 						consumer = newConsumer
+						myGen = n.streamGen.Load()
+						n.log.Info("re-established consumer after stream/consumer loss", "subject", subject)
 					} else {
 						// The stream itself may be gone (not just the consumer);
 						// re-arm the healer so it is re-created, then retry.
 						n.startHealer()
-						n.log.Error(cerr, "failed to re-create lost consumer — retrying", "subject", subject)
+						n.log.Error(cerr, "failed to re-establish consumer — retrying", "subject", subject)
 					}
 				}
 				// Unconditional backoff so a flapping broker can't spin this loop

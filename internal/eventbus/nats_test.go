@@ -139,6 +139,32 @@ func TestStartHealerGuardIsReArmable(t *testing.T) {
 	}
 }
 
+// ISI-1466 residual (child 25d47671): a recreated stream (new Created timestamp)
+// must bump the generation so running subscribers re-establish their consumer;
+// the same stream surviving a reconnect must NOT, so transient blips don't churn
+// (and leak) consumers.
+func TestStreamRecreatedDetection(t *testing.T) {
+	t0 := time.Unix(1_700_000_000, 0)
+	t1 := time.Unix(1_700_000_500, 0) // a later, different Created timestamp
+
+	// First observation (no prior stream) must not count as a recreate.
+	if streamRecreated(time.Time{}, t0) {
+		t.Error("expected first observation not to count as a stream recreate")
+	}
+	// Same stream surviving a reconnect (same Created) must not bump.
+	if streamRecreated(t0, t0) {
+		t.Error("expected an unchanged Created timestamp not to count as a recreate")
+	}
+	// A different Created timestamp means the stream was deleted and recreated.
+	if !streamRecreated(t0, t1) {
+		t.Error("expected a changed Created timestamp to count as a stream recreate")
+	}
+	// Missing current info must not spuriously bump.
+	if streamRecreated(t0, time.Time{}) {
+		t.Error("expected a zero current timestamp not to count as a recreate")
+	}
+}
+
 // Collectors must expose the connected gauge so the controller can register it.
 func TestCollectorsExposesConnectedGauge(t *testing.T) {
 	n := newTestBus()
