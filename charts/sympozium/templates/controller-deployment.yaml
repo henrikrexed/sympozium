@@ -63,6 +63,18 @@ spec:
             # the tool-driven delegation path is unchanged when unset.
             - name: SYMPOZIUM_DELEGATION_CONTROLLER_EXECUTOR
               value: "true"
+            {{- if .Values.delegation.maxInflight }}
+            # Guardrail (ISI-1463): per-ensemble in-flight cap — requeue instead
+            # of fanning out once an ensemble has this many non-terminal runs.
+            - name: SYMPOZIUM_DELEGATION_MAX_INFLIGHT
+              value: {{ .Values.delegation.maxInflight | quote }}
+            {{- end }}
+            {{- if .Values.delegation.maxDepth }}
+            # Guardrail (ISI-1463): delegation depth cap — children at/over this
+            # depth fire no further delegation successors (no unbounded cascade).
+            - name: SYMPOZIUM_DELEGATION_MAX_DEPTH
+              value: {{ .Values.delegation.maxDepth | quote }}
+            {{- end }}
             {{- end }}
             {{- if .Values.observability.enabled }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT

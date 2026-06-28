@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strconv"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -77,7 +78,7 @@ func TestTriggerDelegationSuccessors_DefaultOff(t *testing.T) {
 	r := newAgentRunTestReconciler(t, objs...)
 	// DelegationControllerExecutor left at its zero value (false).
 
-	if err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run); err != nil {
+	if _, err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run); err != nil {
 		t.Fatalf("triggerDelegationSuccessors: %v", err)
 	}
 	if got := listChildRuns(t, r); len(got) != 0 {
@@ -96,7 +97,7 @@ func TestTriggerDelegationSuccessors_EnabledSpawnsChild(t *testing.T) {
 	r := newAgentRunTestReconciler(t, objs...)
 	r.DelegationControllerExecutor = true
 
-	if err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run); err != nil {
+	if _, err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run); err != nil {
 		t.Fatalf("triggerDelegationSuccessors: %v", err)
 	}
 	children := listChildRuns(t, r)
@@ -123,7 +124,7 @@ func TestTriggerDelegationSuccessors_Idempotent(t *testing.T) {
 	r.DelegationControllerExecutor = true
 
 	for i := 0; i < 2; i++ {
-		if err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run); err != nil {
+		if _, err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run); err != nil {
 			t.Fatalf("call %d: %v", i, err)
 		}
 	}
@@ -143,11 +144,189 @@ func TestTriggerDelegationSuccessors_SkipsAlreadyDelegated(t *testing.T) {
 	r := newAgentRunTestReconciler(t, objs...)
 	r.DelegationControllerExecutor = true
 
-	if err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run); err != nil {
+	if _, err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run); err != nil {
 		t.Fatalf("triggerDelegationSuccessors: %v", err)
 	}
 	if got := listChildRuns(t, r); len(got) != 0 {
 		t.Fatalf("expected no controller-spawned child when model already delegated, got %d", len(got))
+	}
+}
+
+// fanoutFixtures returns a source run (cto) whose ensemble has multiple
+// delegation edges all sourced from the same persona — the ISI-1458 fan-out
+// shape. Each edge carries a distinct free-text routing condition. Targets are
+// real Agent instances so any selected edge can spawn.
+func fanoutFixtures(result string) (*sympoziumv1alpha1.AgentRun, []client.Object) {
+	mk := func(persona string) *sympoziumv1alpha1.Agent {
+		return &sympoziumv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "team-" + persona,
+				Namespace: "default",
+				Labels: map[string]string{
+					"sympozium.ai/agent-config": persona,
+					"sympozium.ai/ensemble":     "team",
+				},
+			},
+		}
+	}
+	ensemble := &sympoziumv1alpha1.Ensemble{
+		ObjectMeta: metav1.ObjectMeta{Name: "team", Namespace: "default"},
+		Spec: sympoziumv1alpha1.EnsembleSpec{
+			Relationships: []sympoziumv1alpha1.AgentConfigRelationship{
+				{Source: "cto", Target: "architect", Type: "delegation", Condition: "architecture and solutioning design"},
+				{Source: "cto", Target: "pm", Type: "delegation", Condition: "requirements PRD and epics"},
+				{Source: "cto", Target: "devops", Type: "delegation", Condition: "deployment infrastructure and kubernetes"},
+			},
+		},
+	}
+	run := &sympoziumv1alpha1.AgentRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cto-run",
+			Namespace: "default",
+			Labels:    map[string]string{"sympozium.ai/ensemble": "team"},
+		},
+		Spec: sympoziumv1alpha1.AgentRunSpec{AgentRef: "team-cto", Task: "ship the platform"},
+		Status: sympoziumv1alpha1.AgentRunStatus{
+			Phase:  sympoziumv1alpha1.AgentRunPhaseSucceeded,
+			Result: result,
+		},
+	}
+	objs := []client.Object{
+		mk("cto"), mk("architect"), mk("pm"), mk("devops"), ensemble, run,
+	}
+	return run, objs
+}
+
+// TestTriggerDelegationSuccessors_ConditionAwareRoutesOne is guardrail 3: with a
+// wide fan-out graph, the executor scores edge conditions against the run result
+// and fires only the single best match — not all edges (the ISI-1458 gridlock).
+func TestTriggerDelegationSuccessors_ConditionAwareRoutesOne(t *testing.T) {
+	run, objs := fanoutFixtures("Architecture solutioning complete: the design is ready.")
+	r := newAgentRunTestReconciler(t, objs...)
+	r.DelegationControllerExecutor = true
+
+	if _, err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run); err != nil {
+		t.Fatalf("triggerDelegationSuccessors: %v", err)
+	}
+	children := listChildRuns(t, r)
+	if len(children) != 1 {
+		t.Fatalf("expected exactly 1 routed child (no fan-out), got %d", len(children))
+	}
+	if children[0].Spec.AgentRef != "team-architect" {
+		t.Fatalf("routed to %q, want team-architect (best condition match)", children[0].Spec.AgentRef)
+	}
+}
+
+// TestTriggerDelegationSuccessors_NoMatchNoFanOut verifies that when no edge
+// condition matches the run result, the executor fans out to nothing rather than
+// running the whole team.
+func TestTriggerDelegationSuccessors_NoMatchNoFanOut(t *testing.T) {
+	run, objs := fanoutFixtures("totally unrelated narrative with no routing keywords")
+	r := newAgentRunTestReconciler(t, objs...)
+	r.DelegationControllerExecutor = true
+
+	if _, err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run); err != nil {
+		t.Fatalf("triggerDelegationSuccessors: %v", err)
+	}
+	if got := listChildRuns(t, r); len(got) != 0 {
+		t.Fatalf("expected no children when no condition matches, got %d", len(got))
+	}
+	if run.Labels["sympozium.ai/delegation-triggered"] == "true" {
+		t.Fatal("delegation-triggered marker set despite no fan-out")
+	}
+}
+
+// TestTriggerDelegationSuccessors_InflightCapRequeues is guardrail 1: when the
+// ensemble already has maxInflight non-terminal runs, the executor requeues
+// instead of spawning and does not mark the parent triggered.
+func TestTriggerDelegationSuccessors_InflightCapRequeues(t *testing.T) {
+	run, objs := delegationFixtures()
+	// Add two extra non-terminal runs to the ensemble so inflight == cap (2).
+	for _, name := range []string{"busy-1", "busy-2"} {
+		objs = append(objs, &sympoziumv1alpha1.AgentRun{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				Labels:    map[string]string{"sympozium.ai/ensemble": "team"},
+			},
+			Status: sympoziumv1alpha1.AgentRunStatus{Phase: sympoziumv1alpha1.AgentRunPhaseRunning},
+		})
+	}
+	r := newAgentRunTestReconciler(t, objs...)
+	r.DelegationControllerExecutor = true
+	r.DelegationMaxInflight = 2
+
+	res, err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run)
+	if err != nil {
+		t.Fatalf("triggerDelegationSuccessors: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Fatalf("expected RequeueAfter > 0 when in-flight cap hit, got %v", res.RequeueAfter)
+	}
+	if got := listChildRuns(t, r); len(got) != 0 {
+		t.Fatalf("expected no children when cap hit, got %d", len(got))
+	}
+	if run.Labels["sympozium.ai/delegation-triggered"] == "true" {
+		t.Fatal("parent marked triggered despite being requeued at the cap")
+	}
+}
+
+// TestTriggerDelegationSuccessors_DepthCapStopsCascade is guardrail 2: a run
+// already at the depth cap fires no further delegation successors, and a spawned
+// child is stamped with the incremented depth label.
+func TestTriggerDelegationSuccessors_DepthCapStopsCascade(t *testing.T) {
+	// Child stamping: a depth-0 source spawns a depth-1 child.
+	run, objs := delegationFixtures()
+	r := newAgentRunTestReconciler(t, objs...)
+	r.DelegationControllerExecutor = true
+	if _, err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run); err != nil {
+		t.Fatalf("triggerDelegationSuccessors: %v", err)
+	}
+	children := listChildRuns(t, r)
+	if len(children) != 1 {
+		t.Fatalf("expected 1 child, got %d", len(children))
+	}
+	if got := children[0].Labels["sympozium.ai/delegation-depth"]; got != "1" {
+		t.Fatalf("child delegation-depth = %q, want 1", got)
+	}
+
+	// Cap enforcement: a source already at the depth cap (1) spawns nothing.
+	run2, objs2 := delegationFixtures()
+	run2.Name = "src-run-deep"
+	run2.Labels = map[string]string{"sympozium.ai/delegation-depth": "1"}
+	r2 := newAgentRunTestReconciler(t, objs2...)
+	r2.DelegationControllerExecutor = true
+	if _, err := r2.triggerDelegationSuccessors(context.Background(), logr.Discard(), run2); err != nil {
+		t.Fatalf("triggerDelegationSuccessors (deep): %v", err)
+	}
+	if got := listChildRuns(t, r2); len(got) != 0 {
+		t.Fatalf("expected no children at/over depth cap, got %d", len(got))
+	}
+}
+
+func TestSelectDelegationEdges(t *testing.T) {
+	edges := func(conds ...string) []sympoziumv1alpha1.AgentConfigRelationship {
+		out := make([]sympoziumv1alpha1.AgentConfigRelationship, 0, len(conds))
+		for i, c := range conds {
+			out = append(out, sympoziumv1alpha1.AgentConfigRelationship{
+				Source: "cto", Target: "t" + strconv.Itoa(i), Type: "delegation", Condition: c,
+			})
+		}
+		return out
+	}
+
+	// Single candidate always fires regardless of (un)scorable condition.
+	if got := selectDelegationEdges(edges(""), "anything", "", 1); len(got) != 1 {
+		t.Fatalf("single candidate: got %d, want 1", len(got))
+	}
+	// Best lexical match wins among several.
+	got := selectDelegationEdges(edges("architecture design", "requirements prd"), "the architecture is ready", "", 1)
+	if len(got) != 1 || got[0].Target != "t0" {
+		t.Fatalf("expected single best match t0, got %+v", got)
+	}
+	// No match among several -> none.
+	if got := selectDelegationEdges(edges("architecture", "requirements"), "no keywords here", "", 1); len(got) != 0 {
+		t.Fatalf("expected no selection on zero match, got %d", len(got))
 	}
 }
 

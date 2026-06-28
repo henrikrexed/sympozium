@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,6 +98,25 @@ var deniedEnvVarKeys = map[string]bool{
 // before the oldest are pruned.
 const DefaultRunHistoryLimit = 50
 
+// Controller-side delegation executor guardrail defaults (ISI-1463). These
+// bound the opt-in executor so delegation.controllerExecutor=true can be enabled
+// without re-triggering the ISI-1458 fan-out gridlock.
+const (
+	// defaultDelegationMaxInflight caps non-terminal AgentRuns per ensemble
+	// before the executor requeues instead of spawning. Primary blast-radius
+	// guardrail.
+	defaultDelegationMaxInflight = 3
+	// defaultDelegationMaxDepth caps controller-spawned delegation chaining: a
+	// run at/over this depth fires no further delegation successors.
+	defaultDelegationMaxDepth = 1
+	// defaultDelegationTopK is the max number of delegation edges the executor
+	// fires per completion after condition-aware scoring (route, don't fan out).
+	defaultDelegationTopK = 1
+	// delegationRequeueInterval is how long to wait before retrying a deferred
+	// delegation when the in-flight cap is hit.
+	delegationRequeueInterval = 15 * time.Second
+)
+
 // AgentRunReconciler reconciles AgentRun objects.
 // It watches AgentRun CRDs and reconciles them into Kubernetes Jobs/Pods.
 type AgentRunReconciler struct {
@@ -120,6 +140,21 @@ type AgentRunReconciler struct {
 	// (the agent emitting delegate_to_persona at runtime) remains the
 	// authoritative mechanism and is unchanged when this is off.
 	DelegationControllerExecutor bool
+
+	// DelegationMaxInflight caps the number of non-terminal AgentRuns the
+	// controller-side executor tolerates per ensemble before it requeues
+	// (instead of spawning) a successor. This is the PRIMARY guardrail: it
+	// bounds delegation blast radius regardless of graph shape, preventing the
+	// fan-out gridlock (ISI-1458) that forced the executor off. <=0 uses
+	// defaultDelegationMaxInflight. Only consulted when the executor is enabled.
+	DelegationMaxInflight int
+
+	// DelegationMaxDepth caps how many controller-spawned delegation hops may
+	// chain. Children are stamped with sympozium.ai/delegation-depth; a run at
+	// or over this depth fires no further delegation successors, preventing an
+	// unbounded cascade. <=0 uses defaultDelegationMaxDepth. Only consulted when
+	// the executor is enabled.
+	DelegationMaxDepth int
 
 	// DynamicClient is used for Agent Sandbox CRD operations.
 	// Nil when agent-sandbox support is disabled or CRDs are not installed.
@@ -830,6 +865,7 @@ func (r *AgentRunReconciler) reconcileCompleted(ctx context.Context, log logr.Lo
 
 	// Trigger sequential successors: if this run succeeded and belongs to an
 	// ensemble with sequential relationships, create runs for target personas.
+	result := ctrl.Result{}
 	if agentRun.Status.Phase == sympoziumv1alpha1.AgentRunPhaseSucceeded {
 		if err := r.triggerSequentialSuccessors(ctx, log, agentRun); err != nil {
 			log.Error(err, "Failed to trigger sequential successors")
@@ -839,9 +875,15 @@ func (r *AgentRunReconciler) reconcileCompleted(ctx context.Context, log logr.Lo
 		// Trigger delegation successors: opt-in fallback (default off) that
 		// follows "delegation" edges for models that never emit the
 		// delegate_to_persona tool. No-op unless DelegationControllerExecutor.
-		if err := r.triggerDelegationSuccessors(ctx, log, agentRun); err != nil {
+		// Returns a RequeueAfter when the per-ensemble in-flight cap is hit so
+		// the executor retries once concurrency drains, rather than fanning out.
+		delegResult, err := r.triggerDelegationSuccessors(ctx, log, agentRun)
+		if err != nil {
 			log.Error(err, "Failed to trigger delegation successors")
 			// Non-fatal: don't block cleanup.
+		}
+		if delegResult.RequeueAfter > 0 {
+			result = delegResult
 		}
 	}
 
@@ -851,7 +893,7 @@ func (r *AgentRunReconciler) reconcileCompleted(ctx context.Context, log logr.Lo
 		// Non-fatal: don't block reconciliation.
 	}
 
-	return ctrl.Result{}, nil
+	return result, nil
 }
 
 // reconcileAwaitingDelegate handles AgentRuns that are waiting for a delegated
@@ -1073,37 +1115,50 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 // target the model already delegated to at runtime (recorded in
 // Status.Delegates) are skipped, so enabling the flag on a model that emits
 // some-but-not-all delegations still avoids double-spawning.
-func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) error {
+func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) (ctrl.Result, error) {
 	// Default-off guarantee: no behavior change unless explicitly enabled.
 	if !r.DelegationControllerExecutor {
-		return nil
+		return ctrl.Result{}, nil
 	}
 
 	// Look up the source instance to get the persona name and ensemble.
 	if agentRun.Spec.AgentRef == "" {
-		return nil
+		return ctrl.Result{}, nil
 	}
 	var sourceInst sympoziumv1alpha1.Agent
 	if err := r.Get(ctx, types.NamespacedName{Name: agentRun.Spec.AgentRef, Namespace: agentRun.Namespace}, &sourceInst); err != nil {
-		return nil // Instance gone — skip.
+		return ctrl.Result{}, nil // Instance gone — skip.
 	}
 	sourcePersona := sourceInst.Labels["sympozium.ai/agent-config"]
 	ensembleName := sourceInst.Labels["sympozium.ai/ensemble"]
 	if sourcePersona == "" || ensembleName == "" {
-		return nil // Not part of an ensemble.
+		return ctrl.Result{}, nil // Not part of an ensemble.
 	}
 
 	// Look up the ensemble.
 	var ensemble sympoziumv1alpha1.Ensemble
 	if err := r.Get(ctx, types.NamespacedName{Name: ensembleName, Namespace: agentRun.Namespace}, &ensemble); err != nil {
-		return nil // Ensemble gone — skip.
+		return ctrl.Result{}, nil // Ensemble gone — skip.
 	}
 
 	// Idempotency: skip if we already triggered delegation successors for this
 	// run (prevent duplicates from re-reconciliation). Mirrors the
 	// sequential-triggered marker label.
 	if agentRun.Labels["sympozium.ai/delegation-triggered"] == "true" {
-		return nil
+		return ctrl.Result{}, nil
+	}
+
+	// Guardrail 2 (depth cap): a delegation child stamped at/over the depth cap
+	// does not fire further delegation successors, so a controller-driven chain
+	// cannot cascade unbounded. The originating run carries no depth label
+	// (depth 0); each spawned child is stamped depth+1 below.
+	depth := delegationDepth(agentRun)
+	maxDepth := r.delegationMaxDepth()
+	if depth >= maxDepth {
+		log.Info("Skipping delegation — at/over depth cap",
+			"source", sourcePersona, "ensemble", ensembleName,
+			"depth", depth, "maxDepth", maxDepth)
+		return ctrl.Result{}, nil
 	}
 
 	// Build a set of personas the model already delegated to at runtime so the
@@ -1115,29 +1170,64 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		}
 	}
 
-	// Find delegation edges where this persona is the source.
-	triggered := false
+	// Collect candidate delegation edges: sourced from this persona, active for
+	// the success path, and not already taken by the model at runtime.
+	var candidates []sympoziumv1alpha1.AgentConfigRelationship
 	for _, rel := range ensemble.Spec.Relationships {
 		if rel.Type != "delegation" || rel.Source != sourcePersona {
 			continue
 		}
-
-		// Evaluate the per-edge condition. Condition is free-text describing
-		// when the edge activates; we activate on the completed run's success
-		// unless the condition explicitly scopes the edge to failure.
 		if !delegationEdgeActive(rel.Condition) {
 			log.Info("Skipping delegation edge — condition not met for success",
 				"source", sourcePersona, "target", rel.Target, "condition", rel.Condition)
 			continue
 		}
-
-		targetPersona := rel.Target
-		if alreadyDelegated[targetPersona] {
+		if alreadyDelegated[rel.Target] {
 			log.Info("Skipping delegation edge — model already delegated to target at runtime",
-				"source", sourcePersona, "target", targetPersona)
+				"source", sourcePersona, "target", rel.Target)
 			continue
 		}
+		candidates = append(candidates, rel)
+	}
 
+	// Guardrail 3 (condition-aware edge selection): rather than fanning out to
+	// every active edge (the ISI-1458 gridlock — e.g. cto's 9 edges all firing
+	// on success), score each edge's free-text condition against this run's
+	// result/task and fire only the top match(es) (K=1 by default). A single
+	// candidate is always fired (no fan-out risk); when several compete and none
+	// matches the result, we fan out to none rather than run the whole team.
+	selected := selectDelegationEdges(candidates, agentRun.Status.Result, agentRun.Spec.Task, defaultDelegationTopK)
+	if len(selected) == 0 {
+		if len(candidates) > 0 {
+			log.Info("No delegation edge matched the run result — skipping (no fan-out)",
+				"source", sourcePersona, "ensemble", ensembleName, "candidates", len(candidates))
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Guardrail 1 (concurrency cap, PRIMARY): gate the selected batch on the
+	// per-ensemble in-flight count. If the ensemble already has maxInflight
+	// non-terminal runs, requeue and retry once concurrency drains instead of
+	// adding to the pile. Checked once before spawning the bounded (≤K) batch so
+	// a requeue never partially spawns and then double-spawns on retry.
+	maxInflight := r.delegationMaxInflight()
+	inflight, err := r.countInflightEnsembleRuns(ctx, ensembleName, agentRun.Namespace)
+	if err != nil {
+		// Conservative: if we can't read in-flight state, don't risk a fan-out.
+		log.Error(err, "Failed to count in-flight ensemble runs — deferring delegation",
+			"ensemble", ensembleName)
+		return ctrl.Result{RequeueAfter: delegationRequeueInterval}, nil
+	}
+	if inflight >= maxInflight {
+		log.Info("Delegation in-flight cap reached — requeueing",
+			"ensemble", ensembleName, "inflight", inflight, "maxInflight", maxInflight)
+		return ctrl.Result{RequeueAfter: delegationRequeueInterval}, nil
+	}
+
+	childDepth := depth + 1
+	triggered := false
+	for _, rel := range selected {
+		targetPersona := rel.Target
 		targetAgentName := ensembleName + "-" + targetPersona
 		log.Info("Triggering delegation successor (controller executor)",
 			"source", sourcePersona, "target", targetPersona,
@@ -1167,9 +1257,10 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 				Name:      runName,
 				Namespace: agentRun.Namespace,
 				Labels: map[string]string{
-					"sympozium.ai/instance":        targetAgentName,
-					"sympozium.ai/ensemble":        ensembleName,
-					"sympozium.ai/delegation-from": agentRun.Name,
+					"sympozium.ai/instance":         targetAgentName,
+					"sympozium.ai/ensemble":         ensembleName,
+					"sympozium.ai/delegation-from":  agentRun.Name,
+					"sympozium.ai/delegation-depth": strconv.Itoa(childDepth),
 				},
 			},
 			Spec: sympoziumv1alpha1.AgentRunSpec{
@@ -1232,7 +1323,159 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		}
 	}
 
-	return nil
+	return ctrl.Result{}, nil
+}
+
+// delegationMaxInflight returns the per-ensemble in-flight concurrency cap for
+// the controller-side delegation executor, falling back to the default when not
+// configured.
+func (r *AgentRunReconciler) delegationMaxInflight() int {
+	if r.DelegationMaxInflight > 0 {
+		return r.DelegationMaxInflight
+	}
+	return defaultDelegationMaxInflight
+}
+
+// delegationMaxDepth returns the controller-spawned delegation depth cap,
+// falling back to the default when not configured.
+func (r *AgentRunReconciler) delegationMaxDepth() int {
+	if r.DelegationMaxDepth > 0 {
+		return r.DelegationMaxDepth
+	}
+	return defaultDelegationMaxDepth
+}
+
+// delegationDepth reads the controller-stamped delegation depth from a run's
+// labels. The originating (model-driven or scheduled) run carries no label and
+// is depth 0; each controller-spawned child is stamped depth+1.
+func delegationDepth(run *sympoziumv1alpha1.AgentRun) int {
+	if v := run.Labels["sympozium.ai/delegation-depth"]; v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// countInflightEnsembleRuns counts non-terminal AgentRuns belonging to the given
+// ensemble. This bounds the delegation executor's blast radius: a completed run
+// only spawns successors while the ensemble is below its in-flight cap, so a
+// wide delegation graph cannot fan out into the ISI-1458 gridlock.
+func (r *AgentRunReconciler) countInflightEnsembleRuns(ctx context.Context, ensembleName, namespace string) (int, error) {
+	var runs sympoziumv1alpha1.AgentRunList
+	if err := r.List(ctx, &runs,
+		client.InNamespace(namespace),
+		client.MatchingLabels{"sympozium.ai/ensemble": ensembleName}); err != nil {
+		return 0, err
+	}
+	inflight := 0
+	for i := range runs.Items {
+		switch runs.Items[i].Status.Phase {
+		case sympoziumv1alpha1.AgentRunPhaseSucceeded, sympoziumv1alpha1.AgentRunPhaseFailed:
+			// Terminal — does not count against the cap.
+		default:
+			inflight++
+		}
+	}
+	return inflight, nil
+}
+
+// selectDelegationEdges implements condition-aware edge selection (guardrail 3).
+// Rather than firing every active delegation edge — which on a wide fan-out
+// graph runs the whole team on a single success (the ISI-1458 gridlock) — it
+// scores each edge's free-text condition against the source run's result and
+// task and returns only the top-scoring edge(s), capped at topK.
+//
+// Semantics:
+//   - 0 candidates -> none.
+//   - exactly 1 candidate -> fire it (no fan-out is possible, so an unscorable
+//     or empty condition must not block a legitimate single hand-off).
+//   - several candidates -> score each; return the highest scorers (up to topK)
+//     whose score is > 0. If none matches, return none rather than fanning out.
+func selectDelegationEdges(candidates []sympoziumv1alpha1.AgentConfigRelationship, result, task string, topK int) []sympoziumv1alpha1.AgentConfigRelationship {
+	if len(candidates) == 0 {
+		return nil
+	}
+	if len(candidates) == 1 {
+		return candidates
+	}
+	if topK < 1 {
+		topK = 1
+	}
+
+	haystack := strings.ToLower(result + " " + task)
+	type scoredEdge struct {
+		rel   sympoziumv1alpha1.AgentConfigRelationship
+		score int
+		idx   int
+	}
+	scored := make([]scoredEdge, 0, len(candidates))
+	for i, c := range candidates {
+		scored = append(scored, scoredEdge{rel: c, score: conditionScore(c.Condition, haystack), idx: i})
+	}
+	// Highest score first; stable on original order for ties.
+	sort.SliceStable(scored, func(i, j int) bool {
+		if scored[i].score != scored[j].score {
+			return scored[i].score > scored[j].score
+		}
+		return scored[i].idx < scored[j].idx
+	})
+
+	selected := make([]sympoziumv1alpha1.AgentConfigRelationship, 0, topK)
+	for _, s := range scored {
+		if s.score <= 0 {
+			break // No keyword match — do not fan out to unmatched edges.
+		}
+		selected = append(selected, s.rel)
+		if len(selected) >= topK {
+			break
+		}
+	}
+	return selected
+}
+
+// conditionScore counts how many distinct meaningful tokens from a delegation
+// edge's free-text condition appear in the lowercased source run text. It is a
+// deliberately simple lexical match: the executor is a fallback that approximates
+// the routing the model would have done, not a semantic classifier.
+func conditionScore(condition, haystack string) int {
+	seen := make(map[string]bool)
+	score := 0
+	for _, tok := range tokenizeCondition(condition) {
+		if seen[tok] {
+			continue
+		}
+		seen[tok] = true
+		if strings.Contains(haystack, tok) {
+			score++
+		}
+	}
+	return score
+}
+
+// delegationConditionStopwords are low-signal tokens dropped before scoring a
+// delegation edge condition so common filler words don't inflate matches.
+var delegationConditionStopwords = map[string]bool{
+	"and": true, "the": true, "for": true, "when": true, "with": true,
+	"this": true, "that": true, "from": true, "into": true, "are": true,
+	"any": true, "all": true, "run": true, "task": true, "needs": true,
+	"need": true, "after": true, "before": true, "based": true, "should": true,
+}
+
+// tokenizeCondition splits a free-text condition into lowercased alphanumeric
+// tokens of length >= 3, dropping stopwords. Used by conditionScore.
+func tokenizeCondition(condition string) []string {
+	fields := strings.FieldsFunc(strings.ToLower(condition), func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
+	})
+	tokens := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if len(f) < 3 || delegationConditionStopwords[f] {
+			continue
+		}
+		tokens = append(tokens, f)
+	}
+	return tokens
 }
 
 // delegationEdgeActive evaluates a delegation edge's free-text condition in the
