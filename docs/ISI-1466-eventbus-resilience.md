@@ -77,6 +77,43 @@ The self-heal-against-live-NATS path is best validated by a deploy drill on
 `observable-llm` (kill NATS during controller boot, confirm routing enables once
 NATS returns, with no pod restart) — see deploy handoff below.
 
+## Post-review hardening (ISI-1468 findings folded in)
+
+Amelia's adversarial review (`docs/ISI-1468-code-review.md`) green-lit the change
+(0 critical / 0 high) and surfaced resilience-completeness gaps. Resolved on this
+branch:
+
+- **M1 — durable stream re-heal post-boot.** The background healer is now
+  re-armable via `startHealer` (atomic guard → single healer at a time) and is
+  triggered from the `ReconnectHandler` and from the Subscribe recovery loop when
+  the consumer can't be re-created. So if NATS returns *without* the `sympozium`
+  stream (ephemeral storage / deleted stream), the stream is re-created until it
+  exists instead of the consumer loop spinning forever against a missing stream.
+  The inaccurate "will keep retrying" reconnect log is gone.
+- **M2 — recovery backoff + ephemeral-consumer leak.** The Subscribe fetch loop
+  now applies an **unconditional** `recoveryBackoff` (2s) on any fetch error
+  (closing the spin hole where consumer-create succeeded but Fetch errored), and
+  only re-creates the consumer when the error actually indicates consumer loss
+  (`consumerLost`: `ErrConsumerNotFound` / `ErrConsumerDeleted` /
+  `ErrConsumerDoesNotExist`) — transient connection errors keep the existing
+  connection-bound consumer handle, so we no longer mint (and leak) a new
+  ephemeral consumer on every blip.
+- **M3 — at-most-once across an outage (documented limitation).** The recovered
+  consumer uses `DeliverNew`, so messages published during the
+  disconnect→recovery window are not redelivered. This fix prevents *permanent*
+  routing death, not at-least-once delivery across a blip; durable queue-group
+  delivery is **ISI-1430**'s scope. Documented on `Subscribe`.
+- **L1 — `Healthy()`** now gates on `conn.IsConnected()` (not `!IsClosed()`), so
+  a live disconnect reads unhealthy, consistent with the `connected` gauge.
+- **L2 — `Subscribe` blocking** at startup is documented; all call sites already
+  run it in a ctx-cancellable Runnable.
+
+New tests: `TestConsumerLostClassification`, `TestStartHealerGuardIsReArmable`.
+
+**Drill addendum for ProxOps (ISI-1469):** kill NATS *after* the controller is
+ready (not only during boot) and confirm the stream re-creates and routing
+resumes — this exercises the M1 post-boot path, not just the boot path.
+
 ## Handoff
 
 - **Code review:** Code Reviewer (Amelia) — adversarial review of the

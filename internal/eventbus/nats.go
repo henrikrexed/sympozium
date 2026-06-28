@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,12 @@ const (
 	// streamHealMaxWait caps the backoff between background stream-creation
 	// attempts once the boot budget is exhausted.
 	streamHealMaxWait = 15 * time.Second
+
+	// recoveryBackoff is the minimum delay between Subscribe fetch-loop recovery
+	// iterations. It is applied unconditionally on any fetch error so a flapping
+	// broker (where consumer creation briefly succeeds, then Fetch errors) cannot
+	// spin the loop hot (ISI-1468 M2).
+	recoveryBackoff = 2 * time.Second
 )
 
 // NATSEventBus implements EventBus using NATS JetStream.
@@ -51,6 +58,8 @@ type NATSEventBus struct {
 
 	ready   atomic.Bool
 	readyCh chan struct{} // closed once the stream is first ready
+
+	healing atomic.Bool // true while a background streamHealer is running
 
 	connected prometheus.Gauge
 }
@@ -94,11 +103,13 @@ func NewNATSEventBus(url string, opts ...Option) (*NATSEventBus, error) {
 		}),
 		nats.ReconnectHandler(func(_ *nats.Conn) {
 			n.log.Info("NATS reconnected — re-establishing JetStream stream")
-			// Re-ensure the stream after a reconnect; the server may have
-			// restarted. ensureStream is idempotent (CreateOrUpdate).
-			if _, serr := n.ensureStreamOnce(); serr != nil {
-				n.log.Error(serr, "failed to re-ensure JetStream stream after reconnect — will keep retrying")
-			}
+			// Re-ensure the stream after a reconnect; the server may have come
+			// back without the stream (ephemeral storage, or the stream was
+			// deleted). startHealer retries CreateOrUpdateStream until it exists,
+			// so connection-up/stream-gone can't silently disable routing — a
+			// milder repeat of the ISI-1466 bug (ISI-1468 M1). The healer exits
+			// immediately if the stream is already healthy.
+			n.startHealer()
 		}),
 		nats.ClosedHandler(func(_ *nats.Conn) {
 			n.setConnected(false)
@@ -128,10 +139,20 @@ func NewNATSEventBus(url string, opts ...Option) (*NATSEventBus, error) {
 	}
 	if lastErr != nil {
 		n.log.Error(lastErr, "JetStream stream not ready at boot — channel routing will self-heal once NATS is reachable")
-		go n.streamHealer()
+		n.startHealer()
 	}
 
 	return n, nil
+}
+
+// startHealer launches the background stream healer unless one is already
+// running. It is safe to call concurrently and on every reconnect: the healer
+// exits as soon as the stream exists, so a healthy reconnect costs a single
+// CreateOrUpdateStream and the atomic guard prevents duplicate goroutines.
+func (n *NATSEventBus) startHealer() {
+	if n.healing.CompareAndSwap(false, true) {
+		go n.streamHealer()
+	}
 }
 
 // ensureStreamOnce attempts a single CreateOrUpdateStream and, on success,
@@ -165,9 +186,12 @@ func (n *NATSEventBus) ensureStreamOnce() (jetstream.Stream, error) {
 }
 
 // streamHealer keeps retrying stream creation (with capped backoff) until it
-// succeeds, so a broker that was unreachable at boot eventually enables routing
-// without a process restart.
+// succeeds, so a broker that was unreachable at boot — or one that returns
+// without the stream after a reconnect (ISI-1468 M1) — eventually re-enables
+// routing without a process restart. It clears the healing guard on exit so a
+// future reconnect can re-arm it.
 func (n *NATSEventBus) streamHealer() {
+	defer n.healing.Store(false)
 	wait := 2 * time.Second
 	for {
 		if n.conn.IsClosed() {
@@ -213,9 +237,21 @@ func (n *NATSEventBus) waitReady(ctx context.Context) error {
 	}
 }
 
-// Healthy reports whether the bus is connected and its JetStream stream is ready.
+// Healthy reports whether the bus is currently connected and its JetStream
+// stream is ready. It gates on IsConnected (not just !IsClosed) so a live
+// disconnect — where the connection is reconnecting but not yet Closed — reads
+// as unhealthy, matching the connected gauge (ISI-1468 L1).
 func (n *NATSEventBus) Healthy() bool {
-	return n.ready.Load() && !n.conn.IsClosed()
+	return n.ready.Load() && n.conn.IsConnected()
+}
+
+// consumerLost reports whether a fetch error indicates the consumer no longer
+// exists server-side (reaped across a reconnect), as opposed to a transient
+// connection error that leaves the consumer handle valid.
+func consumerLost(err error) bool {
+	return errors.Is(err, jetstream.ErrConsumerNotFound) ||
+		errors.Is(err, jetstream.ErrConsumerDeleted) ||
+		errors.Is(err, jetstream.ErrConsumerDoesNotExist)
 }
 
 // Collectors returns Prometheus collectors that expose the bus health so the
@@ -267,6 +303,16 @@ func (n *NATSEventBus) Publish(ctx context.Context, topic string, event *Event) 
 // It blocks until the stream is ready (or ctx is cancelled). The internal fetch
 // loop tolerates transient broker outages and re-creates its consumer if it is
 // lost across a reconnect, so subscribers recover without a process restart.
+//
+// Note: because it blocks until NATS is reachable, callers should run Subscribe
+// inside a ctx-cancellable goroutine/Runnable (as all current call sites do); a
+// synchronous caller could otherwise stall boot during a broker outage
+// (ISI-1468 L2).
+//
+// Delivery is at-most-once across an outage: the recovered consumer uses
+// DeliverNew, so messages published during the disconnect→recovery window are
+// not redelivered (ISI-1468 M3). Durable, queue-group at-least-once delivery is
+// tracked separately in ISI-1430.
 func (n *NATSEventBus) Subscribe(ctx context.Context, topic string) (<-chan *Event, error) {
 	if err := n.waitReady(ctx); err != nil {
 		return nil, fmt.Errorf("waiting for event bus readiness for %s: %w", topic, err)
@@ -295,21 +341,34 @@ func (n *NATSEventBus) Subscribe(ctx context.Context, topic string) (<-chan *Eve
 					return
 				default:
 				}
-				// The consumer may have been lost across a reconnect
-				// (ephemeral consumers are reaped by the server). Wait for
-				// readiness and re-create it rather than spinning on errors.
-				if err := n.waitReady(ctx); err != nil {
+				// Wait for readiness — this also covers a stream re-heal across a
+				// reconnect (the healer re-creates the stream; see startHealer).
+				if werr := n.waitReady(ctx); werr != nil {
 					return
 				}
-				if newConsumer, cerr := n.createConsumer(ctx, subject); cerr == nil {
-					consumer = newConsumer
-				} else {
-					n.log.Error(cerr, "failed to re-create consumer after fetch error — retrying", "subject", subject)
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(2 * time.Second):
+				// Only re-create the consumer when it was actually lost (reaped
+				// across a reconnect). Re-creating on *every* fetch error would
+				// mint a fresh ephemeral consumer each iteration, leaking the
+				// prior one server-side until InactiveThreshold reaps it
+				// (ISI-1468 M2). Other fetch errors (transient connection blips)
+				// leave the connection-bound consumer handle valid, so we just
+				// back off and retry it.
+				if consumerLost(err) {
+					if newConsumer, cerr := n.createConsumer(ctx, subject); cerr == nil {
+						consumer = newConsumer
+					} else {
+						// The stream itself may be gone (not just the consumer);
+						// re-arm the healer so it is re-created, then retry.
+						n.startHealer()
+						n.log.Error(cerr, "failed to re-create lost consumer — retrying", "subject", subject)
 					}
+				}
+				// Unconditional backoff so a flapping broker can't spin this loop
+				// hot (ISI-1468 M2 backoff hole).
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(recoveryBackoff):
 				}
 				continue
 			}

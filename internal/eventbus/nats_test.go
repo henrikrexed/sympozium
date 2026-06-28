@@ -2,9 +2,11 @@ package eventbus
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -83,6 +85,57 @@ func TestConnectedGaugeReflectsState(t *testing.T) {
 	n.setConnected(false)
 	if got := gaugeValue(n.connected); got != 0 {
 		t.Fatalf("expected connected gauge to be 0 after setConnected(false), got %v", got)
+	}
+}
+
+// ISI-1468 M2: only an actual consumer-loss error must trigger consumer
+// re-creation; transient connection/fetch errors must not (they would leak
+// ephemeral consumers server-side).
+func TestConsumerLostClassification(t *testing.T) {
+	lost := []error{
+		jetstream.ErrConsumerNotFound,
+		jetstream.ErrConsumerDeleted,
+		jetstream.ErrConsumerDoesNotExist,
+		fmt.Errorf("wrapped: %w", jetstream.ErrConsumerNotFound),
+	}
+	for _, err := range lost {
+		if !consumerLost(err) {
+			t.Errorf("expected consumerLost(%v) = true", err)
+		}
+	}
+
+	notLost := []error{
+		nil,
+		context.DeadlineExceeded,
+		fmt.Errorf("nats: connection closed"),
+	}
+	for _, err := range notLost {
+		if consumerLost(err) {
+			t.Errorf("expected consumerLost(%v) = false", err)
+		}
+	}
+}
+
+// ISI-1468 M1: startHealer must be re-armable but never run two healers at once.
+// The atomic guard admits exactly one goroutine; once it exits, a later call
+// (e.g. a subsequent reconnect) can re-arm it.
+func TestStartHealerGuardIsReArmable(t *testing.T) {
+	n := newTestBus()
+
+	// First arm wins the CAS.
+	if !n.healing.CompareAndSwap(false, true) {
+		t.Fatal("expected healing guard to start cleared")
+	}
+	// While one healer is "running", startHealer must not launch another: the
+	// guard is already set, so a concurrent CAS fails.
+	if n.healing.CompareAndSwap(false, true) {
+		t.Fatal("expected startHealer guard to block a second healer while one runs")
+	}
+
+	// Healer exits -> clears guard -> a later reconnect can re-arm.
+	n.healing.Store(false)
+	if !n.healing.CompareAndSwap(false, true) {
+		t.Fatal("expected healing guard to be re-armable after the healer exits")
 	}
 }
 
