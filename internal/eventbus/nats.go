@@ -369,9 +369,56 @@ func (n *NATSEventBus) Subscribe(ctx context.Context, topic string) (<-chan *Eve
 
 	go func() {
 		defer close(ch)
+
+		// reestablish drops the stale consumer handle and creates a fresh one on
+		// the current stream. On success it adopts the new handle and records the
+		// generation it was created under. On failure it re-arms the healer (the
+		// stream itself may be gone, not just the consumer) and reports false so
+		// the caller backs off before retrying. We do NOT re-create on *every*
+		// error, since that would mint a fresh ephemeral consumer each iteration
+		// and leak the prior one server-side until InactiveThreshold reaps it
+		// (ISI-1468 M2).
+		reestablish := func(reason string) bool {
+			newConsumer, cerr := n.createConsumer(ctx, subject)
+			if cerr != nil {
+				n.startHealer()
+				n.log.Error(cerr, "failed to re-establish consumer — retrying", "subject", subject, "reason", reason)
+				return false
+			}
+			consumer = newConsumer
+			myGen = n.streamGen.Load()
+			n.log.Info("re-established consumer", "subject", subject, "reason", reason)
+			return true
+		}
+
 		for {
 			if ctx.Err() != nil {
 				return
+			}
+
+			// Proactively re-establish when the stream was recreated under us
+			// (streamGen advanced — e.g. NATS came back with empty storage and
+			// the healer re-created the stream). The stale consumer handle's
+			// Fetch does NOT reliably return an inline error in this case: it
+			// yields an empty batch and surfaces the terminal error only via
+			// msgs.Error(), so gating the re-create on a non-nil Fetch error
+			// alone left the subscriber spinning forever on a dead handle with
+			// Active Consumers stuck at 0 (ISI-1470). Checking the generation
+			// here — before Fetch — closes that hole regardless of the fetch
+			// error semantics. A normal reconnect where the stream survives does
+			// not bump the generation, so this is a no-op on the happy path.
+			if n.streamGen.Load() != myGen {
+				if werr := n.waitReady(ctx); werr != nil {
+					return
+				}
+				if !reestablish("stream re-created") {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(recoveryBackoff):
+					}
+				}
+				continue
 			}
 
 			msgs, err := consumer.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
@@ -387,27 +434,11 @@ func (n *NATSEventBus) Subscribe(ctx context.Context, topic string) (<-chan *Eve
 					return
 				}
 				// Re-create the consumer when it was actually lost (reaped across
-				// a reconnect) OR when the stream was recreated under us (streamGen
-				// advanced — e.g. NATS came back with empty storage, which surfaces
-				// as a no-responders/timeout error rather than ErrConsumerNotFound,
-				// so the running subscriber would otherwise spin forever on a stale
-				// handle: ISI-1466 residual / child 25d47671). We do NOT re-create
-				// on *every* fetch error, since that would mint a fresh ephemeral
-				// consumer each iteration and leak the prior one server-side until
-				// InactiveThreshold reaps it (ISI-1468 M2); a transient connection
-				// blip leaves the connection-bound handle valid, so we just back
-				// off and retry it.
+				// a reconnect) OR when the stream was recreated under us. A
+				// transient connection blip leaves the connection-bound handle
+				// valid, so we just back off and retry it rather than churning.
 				if consumerLost(err) || n.streamGen.Load() != myGen {
-					if newConsumer, cerr := n.createConsumer(ctx, subject); cerr == nil {
-						consumer = newConsumer
-						myGen = n.streamGen.Load()
-						n.log.Info("re-established consumer after stream/consumer loss", "subject", subject)
-					} else {
-						// The stream itself may be gone (not just the consumer);
-						// re-arm the healer so it is re-created, then retry.
-						n.startHealer()
-						n.log.Error(cerr, "failed to re-establish consumer — retrying", "subject", subject)
-					}
+					reestablish("consumer/stream loss")
 				}
 				// Unconditional backoff so a flapping broker can't spin this loop
 				// hot (ISI-1468 M2 backoff hole).
@@ -435,6 +466,23 @@ func (n *NATSEventBus) Subscribe(ctx context.Context, topic string) (<-chan *Eve
 					msg.Ack()
 				case <-ctx.Done():
 					return
+				}
+			}
+
+			// A pull batch can terminate with a consumer-lost error that Fetch
+			// did not return inline (it is surfaced only here). Treat it like the
+			// fetch-error path so recovery isn't starved when the consumer is
+			// reaped without an inline error (ISI-1470). A stream re-create is
+			// already handled by the generation check at the top of the loop.
+			if berr := msgs.Error(); berr != nil && consumerLost(berr) {
+				if werr := n.waitReady(ctx); werr != nil {
+					return
+				}
+				reestablish("batch consumer loss")
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(recoveryBackoff):
 				}
 			}
 		}
