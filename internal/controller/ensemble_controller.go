@@ -333,6 +333,17 @@ func (r *EnsembleReconciler) reconcileAgentConfig(
 			needsUpdate = true
 		}
 
+		// Propagate runTimeout changes from persona definition. RunTimeout is
+		// set at create time via buildAgent, but without this an edit to an
+		// existing ensemble's runTimeout never reaches already-stamped Agents —
+		// leaving them on the controller's flat 10m default. That silently caps
+		// scheduled/sequential/delegation runs on slow local models, which then
+		// time out and never close their root run-span (ISI-1481).
+		if existingInst.Spec.Agents.Default.RunTimeout != persona.RunTimeout {
+			existingInst.Spec.Agents.Default.RunTimeout = persona.RunTimeout
+			needsUpdate = true
+		}
+
 		// Propagate baseURL changes (e.g. switching to/from a local provider).
 		// Per-persona baseURL overrides take precedence, then modelRef, then ensemble-level.
 		wantBaseURL := pack.Spec.BaseURL
