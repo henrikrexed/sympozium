@@ -284,6 +284,33 @@ func formatTraceparent(sc trace.SpanContext) string {
 	return fmt.Sprintf("00-%s-%s-%s", sc.TraceID(), sc.SpanID(), flags)
 }
 
+// anchorChildTrace links a spawned child AgentRun to the parent run's trace.
+//
+// ISI-1484 (ISI-1482 workstream A): when the controller spawns a delegation or
+// sequential successor, the child must join the *parent's* trace instead of
+// rooting a fresh one. We start a real, short-lived handoff span anchored to the
+// parent's reconcile span (carried in ctx), End it so it is exported, and stamp
+// its W3C traceparent onto the child via the existing `otel.dev/traceparent`
+// annotation contract. The child's reconciler reads that annotation
+// (extractTraceparent) and the runner adopts it via the TRACEPARENT env var
+// (947cc10), so the whole cto→successor chain shares one trace.id.
+//
+// The annotation points at the handoff span specifically — a span that is
+// guaranteed exported here — so the referenced parent span id always resolves in
+// the backend (the acceptance bar for ISI-1484), never a synthesized/dangling id.
+func (r *AgentRunReconciler) anchorChildTrace(ctx context.Context, child *sympoziumv1alpha1.AgentRun, spanName string, attrs ...attribute.KeyValue) {
+	_, handoff := controllerTracer.Start(ctx, spanName, trace.WithAttributes(attrs...))
+	defer handoff.End()
+	tp := formatTraceparent(handoff.SpanContext())
+	if tp == "" {
+		return
+	}
+	if child.Annotations == nil {
+		child.Annotations = make(map[string]string)
+	}
+	child.Annotations["otel.dev/traceparent"] = tp
+}
+
 // +kubebuilder:rbac:groups=sympozium.ai,resources=agentruns,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=sympozium.ai,resources=agentruns/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=sympozium.ai,resources=agentruns/finalizers,verbs=update
@@ -1130,6 +1157,16 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 			successorRun.Spec.Skills = append(successorRun.Spec.Skills, skill)
 		}
 
+		// ISI-1484: anchor the successor to this run's trace so the pipeline
+		// shows as one connected trace rather than fragmenting per hop.
+		r.anchorChildTrace(ctx, successorRun, "sympozium.sequential.handoff",
+			attribute.String("handoff.lane", "sequential"),
+			attribute.String("handoff.source_persona", sourcePersona),
+			attribute.String("handoff.target_persona", targetPersona),
+			attribute.String("handoff.parent_run", agentRun.Name),
+			attribute.String("handoff.child_run", runName),
+		)
+
 		if err := r.Create(ctx, successorRun); err != nil {
 			if errors.IsAlreadyExists(err) {
 				log.Info("Sequential successor already exists", "run", runName)
@@ -1406,6 +1443,17 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 			}
 			childRun.Spec.Skills = append(childRun.Spec.Skills, skill)
 		}
+
+		// ISI-1484: anchor the delegated child to this run's trace so a
+		// cto→successors delegation chain renders as one connected trace
+		// instead of N disconnected single-span-looking traces.
+		r.anchorChildTrace(ctx, childRun, "sympozium.delegation.handoff",
+			attribute.String("handoff.lane", "delegation"),
+			attribute.String("handoff.source_persona", sourcePersona),
+			attribute.String("handoff.target_persona", targetPersona),
+			attribute.String("handoff.parent_run", agentRun.Name),
+			attribute.String("handoff.child_run", runName),
+		)
 
 		if err := r.Create(ctx, childRun); err != nil {
 			if errors.IsAlreadyExists(err) {
