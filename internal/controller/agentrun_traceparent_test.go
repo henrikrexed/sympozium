@@ -45,7 +45,7 @@ func TestTriggerDelegationSuccessors_StampsTraceparent(t *testing.T) {
 	r := newAgentRunTestReconciler(t, objs...)
 	r.DelegationControllerExecutor = true
 
-	if err := r.triggerDelegationSuccessors(ctx, logr.Discard(), run); err != nil {
+	if _, err := r.triggerDelegationSuccessors(ctx, logr.Discard(), run); err != nil {
 		t.Fatalf("triggerDelegationSuccessors: %v", err)
 	}
 
