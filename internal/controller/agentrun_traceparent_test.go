@@ -85,6 +85,44 @@ func TestTriggerSequentialSuccessors_StampsTraceparent(t *testing.T) {
 	assertJoinedTrace(t, &children[0], parentSC)
 }
 
+// TestAnchorChildTrace_AnchorsToParentPersistedTrace is the ISI-1488 regression.
+// The live reconcile ctx is in one trace (the per-reconcile throwaway root), while
+// the parent run carries a PERSISTED otel.dev/traceparent annotation pointing at a
+// DIFFERENT trace — the trace its runner pod actually adopted. anchorChildTrace
+// must anchor the handoff (and therefore the child) to the parent's persisted
+// trace, not to the live ctx. Pre-fix, the child joined the live-ctx throwaway
+// trace and the cross-run chain never collapsed (live evidence: traces==runs).
+func TestAnchorChildTrace_AnchorsToParentPersistedTrace(t *testing.T) {
+	liveCtx, liveSC, cleanup := withRecordingTracer(t)
+	defer cleanup()
+
+	// The parent run's persisted traceparent — a valid W3C value in a trace that
+	// is deliberately NOT the live ctx's trace.
+	const parentTrace = "11111111111111111111111111111111"
+	parentTP := "00-" + parentTrace + "-2222222222222222-01"
+	parent := &sympoziumv1alpha1.AgentRun{}
+	parent.Annotations = map[string]string{"otel.dev/traceparent": parentTP}
+	child := &sympoziumv1alpha1.AgentRun{}
+
+	r := newAgentRunTestReconciler(t)
+	r.anchorChildTrace(liveCtx, parent, child, "sympozium.test.handoff")
+
+	tp := child.Annotations["otel.dev/traceparent"]
+	if tp == "" {
+		t.Fatal("child carries no otel.dev/traceparent annotation")
+	}
+	childSC := trace.SpanContextFromContext(extractTraceparent(context.Background(), tp))
+	if !childSC.IsValid() {
+		t.Fatalf("traceparent %q did not parse to a valid span context", tp)
+	}
+	if childSC.TraceID().String() != parentTrace {
+		t.Fatalf("child trace.id = %s, want parent persisted trace %s", childSC.TraceID(), parentTrace)
+	}
+	if childSC.TraceID() == liveSC.TraceID() {
+		t.Fatalf("child joined the live-ctx throwaway trace %s; ISI-1488 regression", liveSC.TraceID())
+	}
+}
+
 // assertJoinedTrace asserts the child run carries a traceparent that resolves to
 // the parent's trace.id (cross-run linkage), not an empty or fresh-root id.
 func assertJoinedTrace(t *testing.T, child *sympoziumv1alpha1.AgentRun, parentSC trace.SpanContext) {

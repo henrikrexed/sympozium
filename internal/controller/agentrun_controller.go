@@ -288,18 +288,36 @@ func formatTraceparent(sc trace.SpanContext) string {
 //
 // ISI-1484 (ISI-1482 workstream A): when the controller spawns a delegation or
 // sequential successor, the child must join the *parent's* trace instead of
-// rooting a fresh one. We start a real, short-lived handoff span anchored to the
-// parent's reconcile span (carried in ctx), End it so it is exported, and stamp
-// its W3C traceparent onto the child via the existing `otel.dev/traceparent`
-// annotation contract. The child's reconciler reads that annotation
-// (extractTraceparent) and the runner adopts it via the TRACEPARENT env var
-// (947cc10), so the whole cto→successor chain shares one trace.id.
+// rooting a fresh one. We start a real, short-lived handoff span, End it so it is
+// exported, and stamp its W3C traceparent onto the child via the existing
+// `otel.dev/traceparent` annotation contract. The child's reconciler reads that
+// annotation (extractTraceparent) and the runner adopts it via the TRACEPARENT
+// env var (947cc10), so the whole cto→successor chain shares one trace.id.
 //
-// The annotation points at the handoff span specifically — a span that is
-// guaranteed exported here — so the referenced parent span id always resolves in
-// the backend (the acceptance bar for ISI-1484), never a synthesized/dangling id.
-func (r *AgentRunReconciler) anchorChildTrace(ctx context.Context, child *sympoziumv1alpha1.AgentRun, spanName string, attrs ...attribute.KeyValue) {
-	_, handoff := controllerTracer.Start(ctx, spanName, trace.WithAttributes(attrs...))
+// ISI-1488: the handoff span MUST be anchored to the *parent run's* trace — the
+// trace its runner pod adopted via TRACEPARENT, persisted on the parent in the
+// `otel.dev/traceparent` annotation by reconcilePending. We do NOT anchor to the
+// live reconcile ctx: each Reconcile starts a fresh `agentrun.reconcile` span,
+// and the completion reconcile that fires the successors often lands in a
+// throwaway per-reconcile trace that contains none of the parent's gen_ai work.
+// Anchoring there leaves the child in that throwaway trace and the chain never
+// collapses. Deriving the parent ctx from the persisted annotation puts the
+// handoff (and therefore the child) in the parent's real runner trace.
+//
+// The annotation we stamp on the child points at the handoff span specifically —
+// a span that is guaranteed exported here — so the referenced parent span id
+// always resolves in the backend, never a synthesized/dangling id.
+func (r *AgentRunReconciler) anchorChildTrace(ctx context.Context, parent, child *sympoziumv1alpha1.AgentRun, spanName string, attrs ...attribute.KeyValue) {
+	// Anchor to the parent run's trace, falling back to the live ctx only if the
+	// parent has no persisted traceparent (e.g. an older run created before the
+	// ISI-1488 persistence fix landed).
+	anchorCtx := ctx
+	if parent != nil {
+		if tp := parent.Annotations["otel.dev/traceparent"]; tp != "" {
+			anchorCtx = extractTraceparent(ctx, tp)
+		}
+	}
+	_, handoff := controllerTracer.Start(anchorCtx, spanName, trace.WithAttributes(attrs...))
 	defer handoff.End()
 	tp := formatTraceparent(handoff.SpanContext())
 	if tp == "" {
@@ -534,12 +552,31 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	}
 
 	// Write traceparent annotation so buildContainers can inject TRACEPARENT env var.
+	//
+	// ISI-1488: also DURABLY PERSIST it. The runner pod adopts this value as the
+	// remote parent of its agent.run span, so this annotation identifies the
+	// parent run's real trace. Without an explicit persist the change lives only
+	// on the in-memory object (the later status update writes .Status, not
+	// metadata), so every subsequent reconcile re-reads it empty and roots a
+	// fresh throwaway trace — and anchorChildTrace has no parent trace to anchor
+	// successors to. A metadata-only Patch keeps the spec/skill mutations above
+	// in-memory (they're consumed by buildJob) while making the traceparent
+	// survive across reconciles.
 	traceparent := formatTraceparent(span.SpanContext())
 	if traceparent != "" {
 		if agentRun.Annotations == nil {
 			agentRun.Annotations = map[string]string{}
 		}
-		agentRun.Annotations["otel.dev/traceparent"] = traceparent
+		if agentRun.Annotations["otel.dev/traceparent"] != traceparent {
+			patch := client.MergeFrom(agentRun.DeepCopy())
+			agentRun.Annotations["otel.dev/traceparent"] = traceparent
+			if err := r.Patch(ctx, agentRun, patch); err != nil {
+				// Non-fatal: buildJob still injects TRACEPARENT from the in-memory
+				// value, so the runner trace is unaffected. Only successor anchoring
+				// (ISI-1488) degrades, and anchorChildTrace falls back to live ctx.
+				log.Error(err, "failed to persist traceparent annotation; successor trace anchoring may fragment")
+			}
+		}
 	}
 
 	// Resolve skill sidecars from SkillPack CRDs.
@@ -1159,7 +1196,7 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 
 		// ISI-1484: anchor the successor to this run's trace so the pipeline
 		// shows as one connected trace rather than fragmenting per hop.
-		r.anchorChildTrace(ctx, successorRun, "sympozium.sequential.handoff",
+		r.anchorChildTrace(ctx, agentRun, successorRun, "sympozium.sequential.handoff",
 			attribute.String("handoff.lane", "sequential"),
 			attribute.String("handoff.source_persona", sourcePersona),
 			attribute.String("handoff.target_persona", targetPersona),
@@ -1447,7 +1484,7 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		// ISI-1484: anchor the delegated child to this run's trace so a
 		// cto→successors delegation chain renders as one connected trace
 		// instead of N disconnected single-span-looking traces.
-		r.anchorChildTrace(ctx, childRun, "sympozium.delegation.handoff",
+		r.anchorChildTrace(ctx, agentRun, childRun, "sympozium.delegation.handoff",
 			attribute.String("handoff.lane", "delegation"),
 			attribute.String("handoff.source_persona", sourcePersona),
 			attribute.String("handoff.target_persona", targetPersona),
