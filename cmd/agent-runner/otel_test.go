@@ -13,6 +13,81 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
+// TestStartRunSpanInheritsRemoteParent verifies the ISI-1485 (ISI-1482
+// Workstream B) contract: when the controller injects a TRACEPARENT env var
+// (from the spawning/parent run's exported span), the agent-runner's root
+// "sympozium.agent.run" span adopts it as a REMOTE parent and inherits the
+// parent's trace.id — instead of minting a fresh root. This is what stitches a
+// cto->successors delegation chain into ONE trace.
+func TestStartRunSpanInheritsRemoteParent(t *testing.T) {
+	// Use a provider-scoped tracer directly (passed into agentObservability)
+	// rather than mutating global OTel state — Go OTel resolves package-level
+	// tracer delegates one-shot, so touching the global provider here would
+	// pollute sibling tests (e.g. TestOTelSpanHierarchy).
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	defer tp.Shutdown(context.Background())
+
+	// A known parent trace/span, as the controller would inject it.
+	const parentTraceID = "0123456789abcdef0123456789abcdef"
+	const parentSpanID = "abcdef0123456789"
+	t.Setenv("TRACEPARENT", "00-"+parentTraceID+"-"+parentSpanID+"-01")
+
+	o := &agentObservability{enabled: true, tracer: tp.Tracer("test")}
+
+	ctx := adoptRemoteParent(context.Background())
+	_, runSpan := o.startRunSpan(ctx)
+	runSpan.End()
+	tp.ForceFlush(context.Background())
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("expected exactly 1 run span, got %d", len(spans))
+	}
+	run := spans[0]
+	if run.Name != "sympozium.agent.run" {
+		t.Errorf("span name = %q, want %q", run.Name, "sympozium.agent.run")
+	}
+	// Inherits the parent's trace.id (the whole point of ISI-1482b).
+	if got := run.SpanContext.TraceID().String(); got != parentTraceID {
+		t.Errorf("run span trace.id = %s, want inherited parent %s", got, parentTraceID)
+	}
+	// Parent is the remote span the controller pointed at — not a dangling/new id.
+	if got := run.Parent.SpanID().String(); got != parentSpanID {
+		t.Errorf("run span parent span.id = %s, want %s", got, parentSpanID)
+	}
+	if !run.Parent.IsRemote() {
+		t.Errorf("run span parent should be remote (adopted from TRACEPARENT)")
+	}
+}
+
+// TestStartRunSpanNoTraceparentStartsRoot verifies the fallback: with no
+// TRACEPARENT env, adoptRemoteParent is a no-op and the run span is a fresh
+// root (pre-ISI-1482 behaviour preserved — never fatal).
+func TestStartRunSpanNoTraceparentStartsRoot(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	defer tp.Shutdown(context.Background())
+
+	// Ensure no inherited env from the runner host.
+	t.Setenv("TRACEPARENT", "")
+	t.Setenv("TRACESTATE", "")
+
+	o := &agentObservability{enabled: true, tracer: tp.Tracer("test")}
+	ctx := adoptRemoteParent(context.Background())
+	_, runSpan := o.startRunSpan(ctx)
+	runSpan.End()
+	tp.ForceFlush(context.Background())
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("expected exactly 1 run span, got %d", len(spans))
+	}
+	if spans[0].Parent.IsValid() {
+		t.Errorf("expected a root span (no valid parent), got parent %s", spans[0].Parent.SpanID())
+	}
+}
+
 // TestOTelSpanHierarchy verifies that the agent-runner produces the expected
 // OTel span hierarchy when calling LLMs via mock servers.
 // Uses a single TracerProvider to avoid issues with Go OTel's one-shot

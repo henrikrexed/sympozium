@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -130,6 +131,44 @@ func (o *agentObservability) initMetrics() {
 	if err != nil {
 		log.Printf("failed creating metric sympozium.skill.duration: %v", err)
 	}
+}
+
+// adoptRemoteParent reads the W3C TRACEPARENT (and TRACESTATE) environment
+// variables and returns a context carrying that remote span context, so the
+// run's root span — started immediately afterwards via startRunSpan — adopts
+// the parent as its REMOTE parent and inherits the parent's trace.id instead of
+// minting a fresh root.
+//
+// The controller sets TRACEPARENT from the spawning/parent run's exported span
+// (ISI-1482 contract: AgentRun annotation "otel.dev/traceparent", injected as
+// the TRACEPARENT pod env var by buildContainers). For delegation/sequential/
+// channel successor runs (ISI-1482a/Workstream A) this is the parent run's
+// trace, which is what stitches a cto->successors chain into ONE trace.
+//
+// If TRACEPARENT is unset or malformed, the context is returned unchanged and a
+// new root trace is started (the pre-ISI-1482 behaviour) — never fatal.
+func adoptRemoteParent(ctx context.Context) context.Context {
+	tp := os.Getenv("TRACEPARENT")
+	if tp == "" {
+		log.Println("TRACEPARENT env var not set; starting a new root trace")
+		return ctx
+	}
+	// Use a local W3C propagator so adoption works even when the OTel SDK is
+	// disabled (no global propagator registered) — the extracted remote span
+	// context still flows into startRunSpan's tracer.Start.
+	prop := propagation.TraceContext{}
+	carrier := propagation.MapCarrier{"traceparent": tp}
+	if ts := os.Getenv("TRACESTATE"); ts != "" {
+		carrier["tracestate"] = ts
+	}
+	ctx = prop.Extract(ctx, carrier)
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		log.Printf("TRACEPARENT %q yielded no valid remote span context; starting a new root trace", tp)
+		return ctx
+	}
+	log.Printf("adopted remote parent trace: traceID=%s spanID=%s remote=%v", sc.TraceID(), sc.SpanID(), sc.IsRemote())
+	return ctx
 }
 
 func (o *agentObservability) startRunSpan(ctx context.Context, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
