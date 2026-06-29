@@ -330,7 +330,10 @@ func (n *NATSEventBus) Subscribe(ctx context.Context, topic string) (<-chan *Eve
 		return nil, fmt.Errorf("creating consumer for %s: %w", subject, err)
 	}
 
-	return n.drain(ctx, consumer), nil
+	recreate := func(c context.Context) (jetstream.Consumer, error) {
+		return n.createConsumer(c, subject)
+	}
+	return n.drain(ctx, consumer, subject, recreate), nil
 }
 
 // SubscribeGroup returns a channel that receives events for the given topic via a
@@ -350,24 +353,42 @@ func (n *NATSEventBus) SubscribeGroup(ctx context.Context, topic, group string) 
 	subject := topicToSubject(topic)
 	durable := consumerName(group, subject)
 
-	consumer, err := n.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Durable:       durable,
-		FilterSubject: subject,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		DeliverPolicy: jetstream.DeliverNewPolicy,
-	})
+	// recreate binds (or rebinds) the durable queue-group consumer. It is used
+	// both for the initial bind and by drain's self-heal path so a lost durable is
+	// re-established as a durable (not downgraded to an ephemeral) consumer
+	// (ISI-1430 + ISI-1466).
+	recreate := func(c context.Context) (jetstream.Consumer, error) {
+		stream := n.getStream()
+		if stream == nil {
+			return nil, fmt.Errorf("stream not ready")
+		}
+		return stream.CreateOrUpdateConsumer(c, jetstream.ConsumerConfig{
+			Durable:       durable,
+			FilterSubject: subject,
+			AckPolicy:     jetstream.AckExplicitPolicy,
+			DeliverPolicy: jetstream.DeliverNewPolicy,
+		})
+	}
+
+	consumer, err := recreate(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("creating durable consumer %s for %s: %w", durable, subject, err)
 	}
 
-	return n.drain(ctx, consumer), nil
+	return n.drain(ctx, consumer, subject, recreate), nil
 }
 
 // drain pumps messages from a JetStream consumer into a freshly created channel,
 // decoding each NATS message into an *Event and acking on successful hand-off.
 // Shared by Subscribe (ephemeral) and SubscribeGroup (durable queue group); the
 // only difference between the two is the consumer's identity, not how it drains.
-func (n *NATSEventBus) drain(ctx context.Context, consumer jetstream.Consumer) <-chan *Event {
+//
+// recreate rebuilds the caller's consumer flavor when it is lost across a
+// reconnect (ephemeral for Subscribe, the durable queue-group binding for
+// SubscribeGroup), so the self-heal path (ISI-1466) re-establishes the right kind
+// of consumer regardless of which subscriber owns the loop. subject is used only
+// for log context.
+func (n *NATSEventBus) drain(ctx context.Context, consumer jetstream.Consumer, subject string, recreate func(context.Context) (jetstream.Consumer, error)) <-chan *Event {
 	ch := make(chan *Event, 64)
 
 	go func() {
@@ -397,7 +418,7 @@ func (n *NATSEventBus) drain(ctx context.Context, consumer jetstream.Consumer) <
 				// leave the connection-bound consumer handle valid, so we just
 				// back off and retry it.
 				if consumerLost(err) {
-					if newConsumer, cerr := n.createConsumer(ctx, subject); cerr == nil {
+					if newConsumer, cerr := recreate(ctx); cerr == nil {
 						consumer = newConsumer
 					} else {
 						// The stream itself may be gone (not just the consumer);

@@ -255,6 +255,23 @@ func markSpanError(span trace.Span, err error) {
 	span.SetStatus(codes.Error, err.Error())
 }
 
+// endRunSpanWithReason ends the root run-span, recording an error status that
+// describes why the run was terminated (e.g. a deadline SIGTERM or an in-process
+// context-deadline). This is what keeps a timed-out run from producing a
+// rootless trace fragment: even an abnormally terminated run gets its root span
+// closed so the trace is complete and rooted in Dynatrace.
+//
+// span.End is idempotent in the OTel SDK (only the first call records), so it is
+// safe to invoke this on a signal path even if the normal path already ended the
+// span — the redundant call is a no-op.
+func endRunSpanWithReason(span trace.Span, reason string) {
+	if span == nil {
+		return
+	}
+	span.SetStatus(codes.Error, reason)
+	span.End()
+}
+
 func writeTraceContextMetadata(ctx context.Context) {
 	sc := trace.SpanContextFromContext(ctx)
 	if !sc.IsValid() {
