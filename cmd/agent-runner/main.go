@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -370,13 +373,23 @@ func main() {
 	defer cancel()
 
 	obs := initObservability(ctx)
-	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer shutdownCancel()
-		if err := obs.shutdown(shutdownCtx); err != nil {
-			log.Printf("failed to shutdown OTel providers: %v", err)
-		}
-	}()
+	// flushTelemetry flushes pending spans/metrics/logs and shuts down the OTel
+	// SDK. It is guarded by a sync.Once so it runs exactly once no matter which
+	// exit path reaches it: normal return (via defer), the os.Exit(1) error path
+	// (which would otherwise skip the defer), or the signal handler below.
+	// telemetry.Shutdown caps the flush at its own 3s ShutdownTimeout; we give it
+	// a 5s outer budget, well within the pod's default 30s terminationGracePeriod.
+	var flushOnce sync.Once
+	flushTelemetry := func() {
+		flushOnce.Do(func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			if err := obs.shutdown(shutdownCtx); err != nil {
+				log.Printf("failed to shutdown OTel providers: %v", err)
+			}
+		})
+	}
+	defer flushTelemetry()
 
 	// Extract TRACEPARENT from env so the runner trace joins the controller trace.
 	if tp := os.Getenv("TRACEPARENT"); tp != "" {
@@ -405,6 +418,33 @@ func main() {
 	})
 
 	start := time.Now()
+
+	// Install a SIGTERM/SIGINT handler so a deadline kill still produces a
+	// complete, rooted trace. When a run exceeds its budget, Kubernetes hits the
+	// Job's activeDeadlineSeconds and terminates the pod with SIGTERM, then
+	// SIGKILL after terminationGracePeriodSeconds (default 30s). Without a
+	// handler the process dies on SIGTERM's default disposition: the root
+	// run-span is never ended and the final unflushed OTel batch is lost, so the
+	// trace shows up rootless/incomplete in Dynatrace (reads as "missing
+	// agent-runner spans" — ISI-1483/ISI-1481). On signal we end the root span
+	// with a timeout status, record a terminated-run metric, flush telemetry,
+	// then exit. The 30s grace window comfortably covers the ≤5s flush.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-sigCh
+		reason := fmt.Sprintf("run terminated by signal: %s", sig)
+		log.Printf("%s — ending root run-span and flushing telemetry before exit", reason)
+		logWithTrace(ctx, "error", "agent run terminated by signal", map[string]any{
+			"signal":      sig.String(),
+			"duration_ms": time.Since(start).Milliseconds(),
+		})
+		obs.recordRunMetrics(ctx, "timeout", getEnv("INSTANCE_NAME", ""), modelName, getEnv("AGENT_NAMESPACE", ""), time.Since(start).Milliseconds(), 0, 0)
+		endRunSpanWithReason(runSpan, reason)
+		flushTelemetry()
+		// 128 + SIGTERM(15) = 143, the conventional exit code for SIGTERM.
+		os.Exit(143)
+	}()
 
 	var (
 		responseText string
@@ -499,6 +539,10 @@ func main() {
 		obs.recordRunMetrics(ctx, "error", getEnv("INSTANCE_NAME", ""), modelName, getEnv("AGENT_NAMESPACE", ""), elapsed.Milliseconds(), inputTokens, outputTokens)
 		logWithTrace(ctx, "error", "agent run failed", map[string]any{"error": res.Error})
 		runSpan.End()
+		// os.Exit bypasses deferred flushTelemetry, so flush explicitly here —
+		// otherwise an errored/timed-out run ends its span but the final batch
+		// (1s BatchTimeout) is lost on exit, leaving an incomplete trace.
+		flushTelemetry()
 		log.Printf("agent-runner finished with error: %s", res.Error)
 		os.Exit(1)
 	}
