@@ -13,8 +13,6 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/propagation"
-	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // maxToolIterations is the maximum number of LLM reasoning rounds before
@@ -378,17 +376,11 @@ func main() {
 		}
 	}()
 
-	// Extract TRACEPARENT from env so the runner trace joins the controller trace.
-	if tp := os.Getenv("TRACEPARENT"); tp != "" {
-		log.Printf("TRACEPARENT env var found: %s", tp)
-		prop := propagation.TraceContext{}
-		carrier := propagation.MapCarrier{"traceparent": tp}
-		ctx = prop.Extract(ctx, carrier)
-		sc := oteltrace.SpanContextFromContext(ctx)
-		log.Printf("after extraction: traceID=%s spanID=%s remote=%v valid=%v", sc.TraceID(), sc.SpanID(), sc.IsRemote(), sc.IsValid())
-	} else {
-		log.Println("TRACEPARENT env var not set")
-	}
+	// Adopt the parent run's traceparent (set by the controller from the
+	// spawning run's exported span) as the REMOTE parent of this run's root
+	// span, so a delegation/sequential/channel chain shares one trace.id
+	// instead of fragmenting into N disconnected single-run traces (ISI-1482).
+	ctx = adoptRemoteParent(ctx)
 
 	ctx, runSpan := obs.startRunSpan(ctx,
 		attribute.String("instance", getEnv("INSTANCE_NAME", "")),
