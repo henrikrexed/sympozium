@@ -168,6 +168,10 @@ func (dc *DiscordChannel) handleOutbound(ctx context.Context) {
 			if msg.Channel != "discord" {
 				continue
 			}
+			// ISI-1436: fan-out subject — only the owning instance may post.
+			if !channel.OutboundIsForInstance(event, dc.InstanceName) {
+				continue
+			}
 			if err := dc.sendMessage(msg); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to send discord message: %v\n", err)
 			}

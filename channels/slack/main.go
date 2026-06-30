@@ -526,6 +526,15 @@ func (sc *SlackChannel) handleOutbound(ctx context.Context) {
 			if msg.Channel != "slack" {
 				continue
 			}
+			// ISI-1436: channel.message.send is a fan-out subject — every persona's
+			// channel pod receives every send event. Without this guard each persona
+			// bot with posting access to the target chat re-sends the same reply,
+			// producing the duplicate Slack messages. The controller stamps the owning
+			// instance on publish; only that pod may post. Fail open when the field is
+			// absent (older publishers) to avoid dropping legitimate replies.
+			if !channel.OutboundIsForInstance(event, sc.InstanceName) {
+				continue
+			}
 			if msg.Reaction != "" {
 				if err := sc.addReaction(ctx, msg); err != nil {
 					sc.log.Error(err, "failed to add Slack reaction",
@@ -536,6 +545,12 @@ func (sc *SlackChannel) handleOutbound(ctx context.Context) {
 			if err := sc.sendMessage(ctx, msg); err != nil {
 				sc.log.Error(err, "failed to send Slack message",
 					"chatId", msg.ChatID, "threadId", msg.ThreadID)
+			} else {
+				// Success logging (ISI-1436 observability): the send path was silent,
+				// so duplicate posts were invisible in logs. One line per real send.
+				sc.log.Info("sent Slack message",
+					"chatId", msg.ChatID, "threadId", msg.ThreadID,
+					"instance", sc.InstanceName, "len", len(msg.Text))
 			}
 		}
 	}
