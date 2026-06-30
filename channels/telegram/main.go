@@ -184,6 +184,10 @@ func (tc *TelegramChannel) handleOutbound(ctx context.Context) {
 			if msg.Channel != "telegram" {
 				continue
 			}
+			// ISI-1436: fan-out subject — only the owning instance may post.
+			if !channel.OutboundIsForInstance(event, tc.InstanceName) {
+				continue
+			}
 			_ = tc.sendMessage(ctx, msg)
 		}
 	}

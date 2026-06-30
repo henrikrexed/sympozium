@@ -95,6 +95,25 @@ func (bc *BaseChannel) PublishHealth(ctx context.Context, status HealthStatus) e
 }
 
 // SubscribeOutbound subscribes to outbound messages destined for this channel.
+//
+// channel.message.send is a fan-out subject (eventbus.Subscribe): every persona's
+// channel pod receives every send event, not just its own. Consumers MUST filter
+// with OutboundIsForInstance so only the owning instance posts — otherwise every
+// persona bot with access to the target chat re-sends the same reply, producing
+// duplicate channel messages (ISI-1436).
 func (bc *BaseChannel) SubscribeOutbound(ctx context.Context) (<-chan *eventbus.Event, error) {
 	return bc.EventBus.Subscribe(ctx, eventbus.TopicChannelMessageSend)
+}
+
+// OutboundIsForInstance reports whether an outbound channel.message.send event
+// should be handled by the channel pod for instanceName. The controller stamps
+// the owning instance on publish (event metadata "instanceName"). Fails open
+// (returns true) when no instance is stamped so messages from older publishers
+// are not silently dropped. See ISI-1436.
+func OutboundIsForInstance(event *eventbus.Event, instanceName string) bool {
+	if event == nil {
+		return true
+	}
+	stamped := event.Metadata["instanceName"]
+	return stamped == "" || stamped == instanceName
 }
