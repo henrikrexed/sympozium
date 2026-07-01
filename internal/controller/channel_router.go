@@ -354,6 +354,7 @@ func (cr *ChannelRouter) handleInbound(ctx context.Context, event *eventbus.Even
 	// AgentRun to the named delegate while keeping the receiver as the
 	// Slack-facing front door (Option 2).  Unknown names produce a friendly
 	// note and drop the message.
+	var nameRoutingApplied bool
 	if ensembleName := inst.Labels["sympozium.ai/ensemble"]; ensembleName != "" {
 		if mention, remainder := extractNameMention(msg.Text); mention != "" {
 			var ensemble sympoziumv1alpha1.Ensemble
@@ -385,6 +386,7 @@ func (cr *ChannelRouter) handleInbound(ctx context.Context, event *eventbus.Even
 					inst = &delegateInst
 					msg.InstanceName = delegateInstanceName
 					msg.Text = remainder
+					nameRoutingApplied = true
 					span.SetAttributes(
 						attribute.String("sympozium.slack.routing.delegate", delegate.Name),
 						attribute.String("sympozium.slack.routing.mention", mention),
@@ -397,6 +399,38 @@ func (cr *ChannelRouter) handleInbound(ctx context.Context, event *eventbus.Even
 				}
 			}
 		}
+	}
+
+	// SlackListener routing (ISI-1499 C2): for unaddressed inbound messages
+	// that were not already redirected by @name routing, direct to the
+	// designated Slack-receiver persona when the Ensemble has one set.
+	// Falls back to the receiving inst when none is configured.
+	if !nameRoutingApplied {
+		if ensembleName := inst.Labels["sympozium.ai/ensemble"]; ensembleName != "" {
+			var ensemble sympoziumv1alpha1.Ensemble
+			if err := cr.Client.Get(ctx, client.ObjectKey{Name: ensembleName, Namespace: inst.Namespace}, &ensemble); err == nil {
+				if receiver := resolveSlackReceiver(ensemble.Spec.AgentConfigs); receiver != nil {
+					listenerName := ensembleName + "-" + receiver.Name
+					var listenerInst sympoziumv1alpha1.Agent
+					if err := cr.Client.Get(ctx, client.ObjectKey{Name: listenerName, Namespace: inst.Namespace}, &listenerInst); err == nil && listenerInst.Name != inst.Name {
+						inst = &listenerInst
+						msg.InstanceName = listenerName
+						span.SetAttributes(attribute.String("sympozium.slack.routing.slack_listener", receiver.Name))
+						cr.Log.Info("Routing to SlackListener persona", "listener", listenerName)
+					} else if err != nil {
+						cr.Log.Error(err, "SlackListener Agent not found, using receiving agent", "listener", listenerName)
+					}
+				}
+			}
+		}
+	}
+
+	// Resolve AgentID (ISI-1499 C2): use the resolved inst's agent-config
+	// label so runs carry the persona name rather than the literal "primary".
+	// Standalone Agents (no Ensemble, no agent-config label) keep "primary".
+	agentID := inst.Labels["sympozium.ai/agent-config"]
+	if agentID == "" {
+		agentID = "primary"
 	}
 
 	// Enforce channel access control before creating an AgentRun.
@@ -424,16 +458,24 @@ func (cr *ChannelRouter) handleInbound(ctx context.Context, event *eventbus.Even
 	provider := resolveProvider(inst)
 	authSecret := resolveAuthSecret(inst)
 
+	// Build run labels; include Ensemble/agent-config attrs when present so
+	// the Ensemble controller's per-instance run queries target the right persona.
+	runLabels := map[string]string{
+		"sympozium.ai/instance":       msg.InstanceName,
+		"sympozium.ai/source":         "channel",
+		"sympozium.ai/source-channel": msg.Channel,
+	}
+	if ens := inst.Labels["sympozium.ai/ensemble"]; ens != "" {
+		runLabels["sympozium.ai/ensemble"] = ens
+		runLabels["sympozium.ai/agent-config"] = agentID
+	}
+
 	// Create an AgentRun for the inbound message.
 	run := &sympoziumv1alpha1.AgentRun{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: msg.InstanceName + "-ch-",
 			Namespace:    inst.Namespace,
-			Labels: map[string]string{
-				"sympozium.ai/instance":       msg.InstanceName,
-				"sympozium.ai/source":         "channel",
-				"sympozium.ai/source-channel": msg.Channel,
-			},
+			Labels:       runLabels,
 			Annotations: map[string]string{
 				"sympozium.ai/reply-channel":      msg.Channel,
 				"sympozium.ai/reply-chat-id":      msg.ChatID,
@@ -447,7 +489,7 @@ func (cr *ChannelRouter) handleInbound(ctx context.Context, event *eventbus.Even
 		},
 		Spec: sympoziumv1alpha1.AgentRunSpec{
 			AgentRef:   msg.InstanceName,
-			AgentID:    "primary",
+			AgentID:    agentID,
 			SessionKey: fmt.Sprintf("channel-%s-%s-%d", msg.Channel, msg.ChatID, time.Now().UnixNano()),
 			Task:       msg.Text,
 			Model: sympoziumv1alpha1.ModelSpec{
