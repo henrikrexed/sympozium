@@ -322,6 +322,57 @@ func (cr *ChannelRouter) handleInbound(ctx context.Context, event *eventbus.Even
 		return
 	}
 
+	// @name / name: routing (ISI-1497 C3).
+	// When the inbound text begins with @name or name:, attempt to match
+	// against sibling personas in the same Ensemble.  A match redirects the
+	// AgentRun to the named delegate while keeping the receiver as the
+	// Slack-facing front door (Option 2).  Unknown names produce a friendly
+	// note and drop the message.
+	if ensembleName := inst.Labels["sympozium.ai/ensemble"]; ensembleName != "" {
+		if mention, remainder := extractNameMention(msg.Text); mention != "" {
+			var ensemble sympoziumv1alpha1.Ensemble
+			ensErr := cr.Client.Get(ctx, client.ObjectKey{Name: ensembleName, Namespace: inst.Namespace}, &ensemble)
+			if ensErr == nil {
+				delegate := resolveNamedDelegate(ensemble.Spec.AgentConfigs, mention)
+				if delegate == nil {
+					// Unknown persona — respond with a helpful note and drop.
+					names := make([]string, 0, len(ensemble.Spec.AgentConfigs))
+					for _, p := range ensemble.Spec.AgentConfigs {
+						if p.DisplayName != "" {
+							names = append(names, p.DisplayName)
+						} else {
+							names = append(names, p.Name)
+						}
+					}
+					cr.sendDenialResponse(ctx, msg, fmt.Sprintf(
+						"Sorry, I don't know who %q is. Available personas: %s.",
+						mention, strings.Join(names, ", "),
+					))
+					span.SetAttributes(attribute.String("sympozium.slack.routing.unknown_mention", mention))
+					cr.Log.Info("Unknown @name mention — dropped", "mention", mention, "instance", msg.InstanceName)
+					return
+				}
+				// Redirect to the delegate's Agent instance.
+				delegateInstanceName := ensembleName + "-" + delegate.Name
+				var delegateInst sympoziumv1alpha1.Agent
+				if getErr := cr.Client.Get(ctx, client.ObjectKey{Name: delegateInstanceName, Namespace: inst.Namespace}, &delegateInst); getErr == nil {
+					inst = &delegateInst
+					msg.InstanceName = delegateInstanceName
+					msg.Text = remainder
+					span.SetAttributes(
+						attribute.String("sympozium.slack.routing.delegate", delegate.Name),
+						attribute.String("sympozium.slack.routing.mention", mention),
+					)
+					cr.Log.Info("Routing @name mention to delegate",
+						"mention", mention, "delegate", delegateInstanceName)
+				} else {
+					cr.Log.Error(getErr, "Delegate Agent not found, falling through to receiver",
+						"delegate", delegateInstanceName)
+				}
+			}
+		}
+	}
+
 	// Enforce channel access control before creating an AgentRun.
 	if allowed, denyMsg := checkChannelAccess(inst, &msg); !allowed {
 		span.SetAttributes(attribute.Bool("sympozium.access.denied", true))
@@ -537,6 +588,59 @@ func truncateForLog(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// resolveSlackReceiver returns the first AgentConfigSpec marked slackListener=true.
+// Returns nil when none is set; callers fall back to the first Slack-bound agent
+// (backwards-compatible behaviour for ensembles that predate ISI-1497).
+func resolveSlackReceiver(configs []sympoziumv1alpha1.AgentConfigSpec) *sympoziumv1alpha1.AgentConfigSpec {
+	for i := range configs {
+		if configs[i].SlackListener {
+			return &configs[i]
+		}
+	}
+	return nil
+}
+
+// resolveNamedDelegate matches a bare name token (stripped of any leading @)
+// against AgentConfigSpec.Name and AgentConfigSpec.DisplayName, case-insensitively.
+// Returns nil when there is no match; callers stay on the designated receiver.
+func resolveNamedDelegate(configs []sympoziumv1alpha1.AgentConfigSpec, mention string) *sympoziumv1alpha1.AgentConfigSpec {
+	if mention == "" {
+		return nil
+	}
+	lower := strings.ToLower(mention)
+	for i := range configs {
+		if strings.ToLower(configs[i].Name) == lower || strings.ToLower(configs[i].DisplayName) == lower {
+			return &configs[i]
+		}
+	}
+	return nil
+}
+
+// extractNameMention parses an @name or name: prefix from text (case-insensitive).
+// Returns the bare name token (no leading @, no trailing colon) and the remainder
+// of the message after the prefix, or ("", text) when no such pattern is found.
+func extractNameMention(text string) (name, remainder string) {
+	t := strings.TrimSpace(text)
+	if strings.HasPrefix(t, "@") {
+		// "@name rest of message" — name ends at first whitespace
+		rest := t[1:]
+		idx := strings.IndexAny(rest, " \t\n\r")
+		if idx < 0 {
+			return rest, ""
+		}
+		return rest[:idx], strings.TrimSpace(rest[idx+1:])
+	}
+	// "name: rest of message"
+	idx := strings.Index(t, ":")
+	if idx > 0 {
+		candidate := t[:idx]
+		if !strings.ContainsAny(candidate, " \t\n\r") {
+			return candidate, strings.TrimSpace(t[idx+1:])
+		}
+	}
+	return "", text
 }
 
 // checkChannelAccess evaluates access control rules for the channel that
