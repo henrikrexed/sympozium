@@ -271,6 +271,36 @@ func TestTriggerDelegationSuccessors_InflightCapRequeues(t *testing.T) {
 	}
 }
 
+// TestTriggerDelegationSuccessors_CircuitBreakerBlocks verifies finding 6: when
+// the ensemble circuit breaker is open, the delegation executor spawns no children
+// and returns without error (mirrors spawn_router.go gate).
+func TestTriggerDelegationSuccessors_CircuitBreakerBlocks(t *testing.T) {
+	run, objs := delegationFixtures()
+	// Trip the circuit breaker on the ensemble object in the fixture set.
+	for _, o := range objs {
+		if ens, ok := o.(*sympoziumv1alpha1.Ensemble); ok {
+			ens.Status.CircuitBreakerOpen = true
+			ens.Status.ConsecutiveDelegateFailures = 5
+		}
+	}
+	r := newAgentRunTestReconciler(t, objs...)
+	r.DelegationControllerExecutor = true
+
+	res, err := r.triggerDelegationSuccessors(context.Background(), logr.Discard(), run)
+	if err != nil {
+		t.Fatalf("triggerDelegationSuccessors: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("expected no requeue when circuit breaker is open, got %v", res.RequeueAfter)
+	}
+	if got := listChildRuns(t, r); len(got) != 0 {
+		t.Fatalf("expected no children when circuit breaker open, got %d", len(got))
+	}
+	if run.Labels["sympozium.ai/delegation-triggered"] == "true" {
+		t.Fatal("parent marked triggered despite circuit breaker being open")
+	}
+}
+
 // TestTriggerDelegationSuccessors_DepthCapStopsCascade is guardrail 2: a run
 // already at the depth cap fires no further delegation successors, and a spawned
 // child is stamped with the incremented depth label.

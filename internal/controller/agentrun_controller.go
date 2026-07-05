@@ -1296,6 +1296,15 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		))
 	}
 
+	// Circuit breaker: mirror the spawn_router.go gate so delegation children
+	// are blocked when the ensemble has tripped its consecutive-failure breaker.
+	if ensemble.Status.CircuitBreakerOpen {
+		log.Info("Delegation skipped — ensemble circuit breaker is open",
+			"source", sourcePersona, "ensemble", ensembleName,
+			"consecutiveFailures", ensemble.Status.ConsecutiveDelegateFailures)
+		return ctrl.Result{}, nil
+	}
+
 	depth := delegationDepth(agentRun)
 	maxDepth := r.delegationMaxDepth()
 	if depth >= maxDepth {
