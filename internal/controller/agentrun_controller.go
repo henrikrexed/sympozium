@@ -270,6 +270,51 @@ func formatTraceparent(sc trace.SpanContext) string {
 	return fmt.Sprintf("00-%s-%s-%s", sc.TraceID(), sc.SpanID(), flags)
 }
 
+// anchorChildTrace links a spawned child AgentRun to the parent run's trace.
+//
+// ISI-1484 (ISI-1482 workstream A): when the controller spawns a delegation or
+// sequential successor, the child must join the *parent's* trace instead of
+// rooting a fresh one. We start a real, short-lived handoff span, End it so it is
+// exported, and stamp its W3C traceparent onto the child via the existing
+// `otel.dev/traceparent` annotation contract. The child's reconciler reads that
+// annotation (extractTraceparent) and the runner adopts it via the TRACEPARENT
+// env var (947cc10), so the whole cto→successor chain shares one trace.id.
+//
+// ISI-1488: the handoff span MUST be anchored to the *parent run's* trace — the
+// trace its runner pod adopted via TRACEPARENT, persisted on the parent in the
+// `otel.dev/traceparent` annotation by reconcilePending. We do NOT anchor to the
+// live reconcile ctx: each Reconcile starts a fresh `agentrun.reconcile` span,
+// and the completion reconcile that fires the successors often lands in a
+// throwaway per-reconcile trace that contains none of the parent's gen_ai work.
+// Anchoring there leaves the child in that throwaway trace and the chain never
+// collapses. Deriving the parent ctx from the persisted annotation puts the
+// handoff (and therefore the child) in the parent's real runner trace.
+//
+// The annotation we stamp on the child points at the handoff span specifically —
+// a span that is guaranteed exported here — so the referenced parent span id
+// always resolves in the backend, never a synthesized/dangling id.
+func (r *AgentRunReconciler) anchorChildTrace(ctx context.Context, parent, child *sympoziumv1alpha1.AgentRun, spanName string, attrs ...attribute.KeyValue) {
+	// Anchor to the parent run's trace, falling back to the live ctx only if the
+	// parent has no persisted traceparent (e.g. an older run created before the
+	// ISI-1488 persistence fix landed).
+	anchorCtx := ctx
+	if parent != nil {
+		if tp := parent.Annotations["otel.dev/traceparent"]; tp != "" {
+			anchorCtx = extractTraceparent(ctx, tp)
+		}
+	}
+	_, handoff := controllerTracer.Start(anchorCtx, spanName, trace.WithAttributes(attrs...))
+	defer handoff.End()
+	tp := formatTraceparent(handoff.SpanContext())
+	if tp == "" {
+		return
+	}
+	if child.Annotations == nil {
+		child.Annotations = make(map[string]string)
+	}
+	child.Annotations["otel.dev/traceparent"] = tp
+}
+
 // +kubebuilder:rbac:groups=sympozium.ai,resources=agentruns,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=sympozium.ai,resources=agentruns/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=sympozium.ai,resources=agentruns/finalizers,verbs=update
@@ -493,12 +538,31 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	}
 
 	// Write traceparent annotation so buildContainers can inject TRACEPARENT env var.
+	//
+	// ISI-1488: also DURABLY PERSIST it. The runner pod adopts this value as the
+	// remote parent of its agent.run span, so this annotation identifies the
+	// parent run's real trace. Without an explicit persist the change lives only
+	// on the in-memory object (the later status update writes .Status, not
+	// metadata), so every subsequent reconcile re-reads it empty and roots a
+	// fresh throwaway trace — and anchorChildTrace has no parent trace to anchor
+	// successors to. A metadata-only Patch keeps the spec/skill mutations above
+	// in-memory (they're consumed by buildJob) while making the traceparent
+	// survive across reconciles.
 	traceparent := formatTraceparent(span.SpanContext())
 	if traceparent != "" {
 		if agentRun.Annotations == nil {
 			agentRun.Annotations = map[string]string{}
 		}
-		agentRun.Annotations["otel.dev/traceparent"] = traceparent
+		if agentRun.Annotations["otel.dev/traceparent"] != traceparent {
+			patch := client.MergeFrom(agentRun.DeepCopy())
+			agentRun.Annotations["otel.dev/traceparent"] = traceparent
+			if err := r.Patch(ctx, agentRun, patch); err != nil {
+				// Non-fatal: buildJob still injects TRACEPARENT from the in-memory
+				// value, so the runner trace is unaffected. Only successor anchoring
+				// (ISI-1488) degrades, and anchorChildTrace falls back to live ctx.
+				log.Error(err, "failed to persist traceparent annotation; successor trace anchoring may fragment")
+			}
+		}
 	}
 
 	// Resolve skill sidecars from SkillPack CRDs.
@@ -1009,6 +1073,13 @@ func (r *AgentRunReconciler) reconcileAwaitingDelegate(ctx context.Context, log 
 // source, it creates a new AgentRun for the target persona — implementing the
 // "pipeline" execution pattern where one persona's completion triggers the next.
 func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) error {
+	// Idempotency: skip if we already triggered successors for this run
+	// (prevent duplicates from re-reconciliation). Hoisted before any client
+	// reads to avoid unnecessary work and TOCTOU races.
+	if agentRun.Labels["sympozium.ai/sequential-triggered"] == "true" {
+		return nil
+	}
+
 	// Look up the source instance to get the persona name and ensemble.
 	if agentRun.Spec.AgentRef == "" {
 		return nil
@@ -1027,12 +1098,6 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 	var ensemble sympoziumv1alpha1.Ensemble
 	if err := r.Get(ctx, types.NamespacedName{Name: ensembleName, Namespace: agentRun.Namespace}, &ensemble); err != nil {
 		return nil // Ensemble gone — skip.
-	}
-
-	// Check if we already triggered successors for this run (prevent duplicates
-	// from re-reconciliation). We use a label on the completed run as a marker.
-	if agentRun.Labels["sympozium.ai/sequential-triggered"] == "true" {
-		return nil
 	}
 
 	// Find sequential edges where this persona is the source.
@@ -1067,7 +1132,7 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 		task := buildHandoffTask(sourcePersona, agentRun.Spec.Task, agentRun.Status.Result, targetTask)
 
 		// Create the successor AgentRun.
-		runName := fmt.Sprintf("%s-seq-%d", targetAgentName, time.Now().UnixMilli()%100000)
+		runName := fmt.Sprintf("%s-seq-%s", targetAgentName, agentRun.Name)
 		successorRun := &sympoziumv1alpha1.AgentRun{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      runName,
@@ -1114,6 +1179,18 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 			successorRun.Spec.Skills = append(successorRun.Spec.Skills, skill)
 		}
 
+		// ISI-1484: anchor the successor to this run's trace so the pipeline
+		// shows as one connected trace rather than fragmenting per hop.
+		r.anchorChildTrace(ctx, agentRun, successorRun, "sympozium.sequential.handoff",
+			attribute.String("handoff.lane", "sequential"),
+			attribute.String("handoff.source_persona", sourcePersona),
+			attribute.String("handoff.target_persona", targetPersona),
+			attribute.String("handoff.parent_run", agentRun.Name),
+			attribute.String("handoff.child_run", runName),
+		)
+
+		// Mark triggered before Create so a failure still records the attempt.
+		triggered = true
 		if err := r.Create(ctx, successorRun); err != nil {
 			if errors.IsAlreadyExists(err) {
 				log.Info("Sequential successor already exists", "run", runName)
@@ -1123,7 +1200,6 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 			continue
 		}
 		log.Info("Created sequential successor run", "run", runName, "target", targetPersona)
-		triggered = true
 
 		// Handoff latency: the dead time between the predecessor completing and
 		// this successor being created. from/to are persona names (bounded
@@ -1175,6 +1251,13 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		return ctrl.Result{}, nil
 	}
 
+	// Idempotency: skip if we already triggered delegation successors for this
+	// run (prevent duplicates from re-reconciliation). Hoisted before any
+	// client reads to avoid unnecessary work and TOCTOU races.
+	if agentRun.Labels["sympozium.ai/delegation-triggered"] == "true" {
+		return ctrl.Result{}, nil
+	}
+
 	// Look up the source instance to get the persona name and ensemble.
 	if agentRun.Spec.AgentRef == "" {
 		return ctrl.Result{}, nil
@@ -1193,13 +1276,6 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 	var ensemble sympoziumv1alpha1.Ensemble
 	if err := r.Get(ctx, types.NamespacedName{Name: ensembleName, Namespace: agentRun.Namespace}, &ensemble); err != nil {
 		return ctrl.Result{}, nil // Ensemble gone — skip.
-	}
-
-	// Idempotency: skip if we already triggered delegation successors for this
-	// run (prevent duplicates from re-reconciliation). Mirrors the
-	// sequential-triggered marker label.
-	if agentRun.Labels["sympozium.ai/delegation-triggered"] == "true" {
-		return ctrl.Result{}, nil
 	}
 
 	// Guardrail 2 (depth cap): a delegation child stamped at/over the depth cap
@@ -1254,9 +1330,9 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		if rel.Type != "delegation" || rel.Source != sourcePersona {
 			continue
 		}
-		if !delegationEdgeActive(rel.Condition) {
+		if !delegationEdgeActive(rel.Condition, rel.Trigger) {
 			log.Info("Skipping delegation edge — condition not met for success",
-				"source", sourcePersona, "target", rel.Target, "condition", rel.Condition)
+				"source", sourcePersona, "target", rel.Target, "condition", rel.Condition, "trigger", rel.Trigger)
 			recordEdge("skipped_condition", 1)
 			continue
 		}
@@ -1343,7 +1419,7 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		task := buildHandoffTask(sourcePersona, agentRun.Spec.Task, agentRun.Status.Result, targetTask)
 
 		// Create the delegation child AgentRun.
-		runName := fmt.Sprintf("%s-deleg-%d", targetAgentName, time.Now().UnixMilli()%100000)
+		runName := fmt.Sprintf("%s-deleg-%s", targetAgentName, agentRun.Name)
 		childRun := &sympoziumv1alpha1.AgentRun{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      runName,
@@ -1391,6 +1467,19 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 			childRun.Spec.Skills = append(childRun.Spec.Skills, skill)
 		}
 
+		// ISI-1484: anchor the delegated child to this run's trace so a
+		// cto→successors delegation chain renders as one connected trace
+		// instead of N disconnected single-span-looking traces.
+		r.anchorChildTrace(ctx, agentRun, childRun, "sympozium.delegation.handoff",
+			attribute.String("handoff.lane", "delegation"),
+			attribute.String("handoff.source_persona", sourcePersona),
+			attribute.String("handoff.target_persona", targetPersona),
+			attribute.String("handoff.parent_run", agentRun.Name),
+			attribute.String("handoff.child_run", runName),
+		)
+
+		// Mark triggered before Create so a failure still records the attempt.
+		triggered = true
 		if err := r.Create(ctx, childRun); err != nil {
 			if errors.IsAlreadyExists(err) {
 				log.Info("Delegation successor already exists", "run", runName)
@@ -1400,7 +1489,6 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 			continue
 		}
 		log.Info("Created delegation successor run", "run", runName, "target", targetPersona)
-		triggered = true
 
 		// I2 fired + I4 depth: a real spawn at childDepth. max(depth_observed)
 		// proves no child exceeds DelegationMaxDepth.
@@ -1590,12 +1678,24 @@ func tokenizeCondition(condition string) []string {
 	return tokens
 }
 
-// delegationEdgeActive evaluates a delegation edge's free-text condition in the
-// post-success reconcile path. The controller executor only runs after the
-// source run succeeds, so an empty condition (or one describing success/explicit
-// request) activates the edge. Conditions that explicitly scope the edge to the
-// source *failing* are not met on success and are skipped.
-func delegationEdgeActive(condition string) bool {
+// delegationEdgeActive evaluates whether a delegation edge should fire in the
+// post-success reconcile path. Supports structured Trigger field (preferred):
+//   - "Success"  → active (we are in success path)
+//   - "Failure"  → inactive in success path
+//   - "Always"   → active
+// Falls back to free-text condition evaluation for backward compatibility.
+func delegationEdgeActive(condition string, trigger string) bool {
+	// Structured trigger field takes precedence (ISI-1562 finding 5).
+	switch strings.ToLower(strings.TrimSpace(trigger)) {
+	case "success":
+		return true
+	case "failure":
+		return false
+	case "always":
+		return true
+	}
+
+	// Fallback: free-text condition evaluation for backward compatibility.
 	c := strings.ToLower(strings.TrimSpace(condition))
 	if c == "" {
 		return true

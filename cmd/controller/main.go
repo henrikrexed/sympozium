@@ -93,9 +93,11 @@ func main() {
 	// Env override mirrors the SYMPOZIUM_IMAGE_TAG pattern so the Helm chart can
 	// toggle the controller-side delegation executor via a chart value without
 	// passing CLI flags. Default false — flag default already off; env only
-	// flips it on.
-	if os.Getenv("SYMPOZIUM_DELEGATION_CONTROLLER_EXECUTOR") == "true" {
-		delegationControllerExecutor = true
+	// flips it on. Uses strconv.ParseBool so Helm-quoted "false" is not truthy.
+	if v := os.Getenv("SYMPOZIUM_DELEGATION_CONTROLLER_EXECUTOR"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			delegationControllerExecutor = b
+		}
 	}
 
 	// Guardrail caps (ISI-1463) mirror the same env-override pattern so the Helm

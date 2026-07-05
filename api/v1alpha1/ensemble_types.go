@@ -406,6 +406,14 @@ type AgentConfigRelationship struct {
 	// (e.g. "when source run succeeds", "on explicit request").
 	// +optional
 	Condition string `json:"condition,omitempty"`
+	// Trigger is a structured enum controlling when this edge fires.
+	// Success — fire when source succeeds (default for delegation/sequential).
+	// Failure — fire when source fails.
+	// Always  — fire regardless of source outcome.
+	// When set, it takes precedence over Condition.
+	// +kubebuilder:validation:Enum=Success;Failure;Always
+	// +optional
+	Trigger string `json:"trigger,omitempty"`
 
 	// Timeout is the maximum duration to wait for the target to complete.
 	// Applies to delegation and sequential types. Format: "5m", "1h".

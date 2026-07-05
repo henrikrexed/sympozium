@@ -331,6 +331,7 @@ func TestSelectDelegationEdges(t *testing.T) {
 }
 
 func TestDelegationEdgeActive(t *testing.T) {
+	// Test free-text condition fallback (empty trigger)
 	cases := []struct {
 		condition string
 		want      bool
@@ -344,8 +345,27 @@ func TestDelegationEdgeActive(t *testing.T) {
 		{"when rejected by reviewer", false},
 	}
 	for _, c := range cases {
-		if got := delegationEdgeActive(c.condition); got != c.want {
-			t.Errorf("delegationEdgeActive(%q) = %v, want %v", c.condition, got, c.want)
+		if got := delegationEdgeActive(c.condition, ""); got != c.want {
+			t.Errorf("delegationEdgeActive(%q, \"\") = %v, want %v", c.condition, got, c.want)
+		}
+	}
+
+	// Test structured trigger field (ISI-1562 finding 5)
+	triggerCases := []struct {
+		trigger string
+		want    bool
+	}{
+		{"Success", true},
+		{"success", true},
+		{"Failure", false},
+		{"failure", false},
+		{"Always", true},
+		{"always", true},
+		{"", true}, // empty falls back to condition
+	}
+	for _, c := range triggerCases {
+		if got := delegationEdgeActive("some condition", c.trigger); got != c.want {
+			t.Errorf("delegationEdgeActive(\"some condition\", %q) = %v, want %v", c.trigger, got, c.want)
 		}
 	}
 }
