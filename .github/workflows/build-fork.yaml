@@ -1,0 +1,86 @@
+name: Build Fork Images (ISI-1406)
+
+# Fork-only build pipeline. Publishes the ISI-1406 multi-agent observability
+# images to Henrik's fork registry (ghcr.io/henrikrexed/sympozium) so the
+# observable-llm Sympozium instance can be redeployed with the new OTel signals.
+#
+# The upstream build.yaml targets ghcr.io/sympozium-ai/sympozium and only fires
+# on `main`, so it cannot publish into the fork. This workflow fills that gap.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/isi-1406-multiagent-obs
+      - isi1406-fork-build
+      - isi1436-integration-test
+      - isi1593-genai-forkbuild
+
+env:
+  REGISTRY: ghcr.io/henrikrexed/sympozium
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - controller        # ISI-1406: reason label, traceparent chain, handoff latency, context tokens, access counter
+          - skill-memory      # ISI-1406: memory.read / memory.write counters (cmd/memory-server)
+          - agent-runner
+          - apiserver
+          - ipc-bridge
+          - webhook
+          - web-proxy
+          - channel-telegram
+          - channel-whatsapp
+          - channel-discord
+          - channel-slack
+          - skill-k8s-ops
+          - skill-sre-observability
+          - skill-github-gitops
+          - skill-llmfit
+          - mcp-bridge
+          - node-probe
+          - llmfit-daemon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image }}
+          tags: |
+            type=raw,value=isi1406
+            type=sha,prefix=isi1406-
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: images/${{ matrix.image }}/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
