@@ -3661,7 +3661,10 @@ func resolveTrustPeers(agentConfig string, trustGroups []sympoziumv1alpha1.Trust
 func (r *AgentRunReconciler) buildVolumes(agentRun *sympoziumv1alpha1.AgentRun, memoryEnabled bool, sidecars []resolvedSidecar, mcpServers []sympoziumv1alpha1.MCPServerRef) []corev1.Volume {
 	workspaceSizeLimit := resource.MustParse("1Gi")
 	ipcSizeLimit := resource.MustParse("64Mi")
-	tmpSizeLimit := resource.MustParse("256Mi")
+	// ISI-1612: match /workspace (1Gi). Skill-heavy agents (e.g. code-reviewer)
+	// clone GitHub repos into /tmp; 256Mi caused EmptyDir eviction (exit 137) →
+	// BackoffLimitExceeded → dropped Slack reply.
+	tmpSizeLimit := resource.MustParse("1Gi")
 	memoryMedium := corev1.StorageMediumMemory
 
 	// Use a PVC for /workspace when postRun lifecycle hooks are defined,
@@ -5054,7 +5057,9 @@ func (r *AgentRunReconciler) buildPostRunJob(
 	}
 
 	// Volumes: workspace PVC + tmp EmptyDir.
-	tmpSizeLimit := resource.MustParse("256Mi")
+	// ISI-1612: 1Gi to match /workspace; skill sidecars can write large artifacts
+	// into /tmp (repo clones). 256Mi caused pod eviction (exit 137).
+	tmpSizeLimit := resource.MustParse("1Gi")
 	volumes := []corev1.Volume{
 		{
 			Name: "workspace",
