@@ -4119,6 +4119,12 @@ func classifyFailureReason(reason string) string {
 		return "policy"
 	case strings.Contains(r, "token budget") || strings.Contains(r, "budget exceeded") || strings.Contains(r, "quota"):
 		return "token_budget"
+	// The agent-runner emits "exceeded maximum tool-call iterations (N)" when a
+	// run is killed by the per-agent tool-call cap. Give it a distinct bucket so
+	// the kill is alertable/dashboardable via SLO instead of collapsing into the
+	// generic "other" total (ISI-1671; the miss that hid ISI-1666).
+	case strings.Contains(r, "tool-call iterations") || strings.Contains(r, "maximum tool-call") || strings.Contains(r, "max tool iterations"):
+		return "max_tool_iterations"
 	case strings.Contains(r, "model") && (strings.Contains(r, "not found") || strings.Contains(r, "not ready")):
 		return "model_unavailable"
 	case strings.Contains(r, "delegate"):
