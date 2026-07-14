@@ -33,8 +33,19 @@ type EventBus interface {
 	// Publish sends an event to the bus.
 	Publish(ctx context.Context, topic string, event *Event) error
 
-	// Subscribe returns a channel that receives events for the given topic.
+	// Subscribe returns a channel that receives events for the given topic via
+	// an ephemeral, non-load-balanced consumer: every Subscribe call receives
+	// every matching message (fan-out). Use this for distinct logical consumers
+	// that each need their own copy of an event, or for dynamic per-run subjects.
 	Subscribe(ctx context.Context, topic string) (<-chan *Event, error)
+
+	// SubscribeGroup returns a channel that receives events for the given topic
+	// via a durable queue-group consumer shared by all subscribers that pass the
+	// same group. Instances of one logical subscriber (e.g. ChannelRouter
+	// replicas) that use the same group load-balance messages — each event is
+	// delivered to exactly one instance instead of being fanned out to all of
+	// them. Distinct groups remain independent and each receive their own copy.
+	SubscribeGroup(ctx context.Context, topic, group string) (<-chan *Event, error)
 
 	// Close shuts down the event bus connection.
 	Close() error
