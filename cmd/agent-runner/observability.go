@@ -30,6 +30,7 @@ type agentObservability struct {
 	inTok           metric.Int64Counter
 	outTok          metric.Int64Counter
 	toolInvocations metric.Int64Counter
+	toolCallIters   metric.Int64Histogram
 	skillDurMs      metric.Float64Histogram
 }
 
@@ -126,6 +127,20 @@ func (o *agentObservability) initMetrics() {
 	if err != nil {
 		log.Printf("failed creating metric sympozium.tool.invocations: %v", err)
 	}
+	// Per-run count of tool-call iterations (reasoning rounds). Distinct from
+	// sympozium.tool.invocations (a cumulative counter): this is the per-run
+	// value that must be compared against the configured max_tool_iterations
+	// cap to catch runs approaching the kill limit (ISI-1671). A histogram lets
+	// a dashboard chart the distribution and the toolCalls/limit ratio without
+	// grepping the __SYMPOZIUM_RESULT__ stdout marker.
+	o.toolCallIters, err = meter.Int64Histogram(
+		"sympozium.agent.tool_call_iterations",
+		metric.WithUnit("{iteration}"),
+		metric.WithDescription("Per-run tool-call iterations (reasoning rounds) executed by an agent run; compare against sympozium.max_tool_calls to spot runs approaching the cap"),
+	)
+	if err != nil {
+		log.Printf("failed creating metric sympozium.agent.tool_call_iterations: %v", err)
+	}
 	o.skillDurMs, err = meter.Float64Histogram("sympozium.skill.duration")
 	if err != nil {
 		log.Printf("failed creating metric sympozium.skill.duration: %v", err)
@@ -187,6 +202,22 @@ func (o *agentObservability) recordRunMetrics(
 	if outputTokens > 0 && o.outTok != nil {
 		o.outTok.Add(ctx, int64(outputTokens), metric.WithAttributes(attribute.String("model", model)))
 	}
+}
+
+// recordToolCallIterations emits the per-run tool-call iteration count as an
+// OTLP histogram so operators can dashboard/alert on runs approaching the
+// configured cap (ISI-1671) instead of grepping the stdout result marker. The
+// runner has no agent identifier distinct from the instance (INSTANCE_NAME ==
+// AgentRef == the Agent name), so it is sliced by instance + model; model
+// matters because the cap-ratio dashboard is per-model.
+func (o *agentObservability) recordToolCallIterations(ctx context.Context, instance, model string, toolCalls int) {
+	if o == nil || !o.enabled || o.toolCallIters == nil {
+		return
+	}
+	o.toolCallIters.Record(ctx, int64(toolCalls), metric.WithAttributes(
+		attribute.String("instance", instance),
+		attribute.String("model", model),
+	))
 }
 
 func (o *agentObservability) recordToolInvocation(ctx context.Context, toolName, status string) {

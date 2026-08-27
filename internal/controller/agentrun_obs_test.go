@@ -18,6 +18,8 @@ func TestClassifyFailureReason(t *testing.T) {
 		{"policy validation failed: tool denied", "policy"},
 		{"gate hook validation failed", "policy"},
 		{"token budget exceeded: 1000 > 500", "token_budget"},
+		{"exceeded maximum tool-call iterations (50)", "max_tool_iterations"},
+		{"exceeded maximum tool-call iterations (150)", "max_tool_iterations"},
 		{`model "qwen3.6" not found`, "model_unavailable"},
 		{`model "qwen3.6" is not ready (phase: Pending)`, "model_unavailable"},
 		{"delegate child run failed", "delegate_failed"},

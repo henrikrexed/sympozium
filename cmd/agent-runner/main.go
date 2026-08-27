@@ -359,6 +359,10 @@ func main() {
 		attribute.String("tenant.namespace", getEnv("AGENT_NAMESPACE", "")),
 		attribute.String("model", modelName),
 		attribute.String("task.summary", truncate(task, 200)),
+		// The configured per-run tool-call cap. Recording it on the span lets a
+		// trace-side query compute the toolCalls/limit ratio and surface which
+		// runs died to the cap vs merely approached it (ISI-1671).
+		attribute.Int("sympozium.max_tool_calls", maxToolIterations),
 	)
 	writeTraceContextMetadata(ctx)
 	logWithTrace(ctx, "info", "agent run started", map[string]any{
@@ -495,6 +499,13 @@ func main() {
 	var res agentResult
 	res.Metrics.DurationMs = elapsed.Milliseconds()
 	res.Metrics.ToolCalls = toolCalls
+
+	// Promote the per-run tool-call iteration count to an OTLP histogram so a
+	// 'runs approaching the cap' dashboard can chart toolCalls / max_tool_calls
+	// without grepping the __SYMPOZIUM_RESULT__ stdout marker (ISI-1671).
+	// Recorded on both the success and error paths — a run that dies to the cap
+	// is exactly the case operators most need to see.
+	obs.recordToolCallIterations(ctx, getEnv("INSTANCE_NAME", ""), modelName, toolCalls)
 
 	debugMode := getEnv("DEBUG", "") == "true"
 
